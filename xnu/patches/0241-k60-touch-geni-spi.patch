@@ -102,13 +102,16 @@ new file mode 100644
 +#define K60_GCC_VOTE		0x62008u
 +#define K60_GCC_VOTE_M_AHB	(1u << 20)
 +#define K60_GCC_VOTE_S_AHB	(1u << 21)
-+#define K60_GCC_VOTE_CORE	(1u << 22)
-+#define K60_GCC_VOTE_CORE_2X	(1u << 23)
++#define K60_GCC_VOTE_CORE	(1u << 19)
++#define K60_GCC_VOTE_CORE_2X	(1u << 18)
 +#define K60_GCC_VOTE_SE4	(1u << 26)
-+/* Only the three branches FDT names for this SE: se-clk, m-ahb, s-ahb. */
++/* The five branches gcc-sm8450.c enables for QUPV3 wrap 1. */
 +#define K60_GCC_VOTE_MASK	(K60_GCC_VOTE_M_AHB | K60_GCC_VOTE_S_AHB | \
++				 K60_GCC_VOTE_CORE | K60_GCC_VOTE_CORE_2X | \
 +				 K60_GCC_VOTE_SE4)
 +
++#define K60_GCC_CORE_2X_HALT	0x3314cu
++#define K60_GCC_CORE_HALT	0x33140u
 +#define K60_GCC_M_AHB_HALT	0x28004u
 +#define K60_GCC_S_AHB_HALT	0x28008u
 +#define K60_GCC_SE4_HALT	0x284dcu
@@ -213,7 +216,7 @@ new file mode 100644
 +int
 +k60_touch_clocks_on(void)
 +{
-+	uint32_t before, after, cmd, cfg, halt_m, halt_s, halt_se;
++	uint32_t before, after, cmd, cfg, halt_m, halt_s, halt_se, halt_c, halt_c2;
 +	unsigned i, missed = 0;
 +
 +	printf("K60 TOUCH: stage 3: gcc %#lx window %#lx, no SE access yet\n",
@@ -233,8 +236,8 @@ new file mode 100644
 +	after = K60_TOUCH_RD(k60_gcc + K60_GCC_VOTE);
 +	printf("K60 TOUCH: gcc vote %#x -> %#x, bits %#x\n", before, after,
 +	    after & K60_GCC_VOTE_MASK);
-+	for (i = 0; i < 3; i++) {
-+		static const uint32_t bit[3] = { 20, 21, 26 };
++	for (i = 0; i < 5; i++) {
++		static const uint32_t bit[5] = { 18, 19, 20, 21, 26 };
 +		uint32_t on = (after >> bit[i]) & 1u;
 +
 +		printf("K60 TOUCH: gcc vote bit%u on=%u\n", bit[i], on);
@@ -254,7 +257,10 @@ new file mode 100644
 +		halt_m = K60_TOUCH_RD(k60_gcc + K60_GCC_M_AHB_HALT);
 +		halt_s = K60_TOUCH_RD(k60_gcc + K60_GCC_S_AHB_HALT);
 +		halt_se = K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_HALT);
-+		if (!((halt_m | halt_s | halt_se) & K60_CLOCK_OFF)) {
++		halt_c = K60_TOUCH_RD(k60_gcc + K60_GCC_CORE_HALT);
++		halt_c2 = K60_TOUCH_RD(k60_gcc + K60_GCC_CORE_2X_HALT);
++		if (!((halt_m | halt_s | halt_se | halt_c | halt_c2) &
++		    K60_CLOCK_OFF)) {
 +			break;
 +		}
 +		delay(10);
@@ -262,8 +268,10 @@ new file mode 100644
 +	halt_m = K60_TOUCH_RD(k60_gcc + K60_GCC_M_AHB_HALT);
 +	halt_s = K60_TOUCH_RD(k60_gcc + K60_GCC_S_AHB_HALT);
 +	halt_se = K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_HALT);
-+	printf("K60 TOUCH: gcc halt m/s/se %#x/%#x/%#x\n", halt_m, halt_s,
-+	    halt_se);
++	halt_c = K60_TOUCH_RD(k60_gcc + K60_GCC_CORE_HALT);
++	halt_c2 = K60_TOUCH_RD(k60_gcc + K60_GCC_CORE_2X_HALT);
++	printf("K60 TOUCH: gcc halt m/s/se/c/c2 %#x/%#x/%#x/%#x/%#x\n",
++	    halt_m, halt_s, halt_se, halt_c, halt_c2);
 +	k60_touch_flush();
 +
 +	/*
