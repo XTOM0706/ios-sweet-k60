@@ -56,7 +56,7 @@ diff --git a/bsd/dev/k60_touch_geni.c b/bsd/dev/k60_touch_geni.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_touch_geni.c
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,517 @@
 +/*
 + * K60（mondrian，SM8475）触摸：GCC 时钟与 QUPv3 SE4 上的 GENI SPI。
 + *
