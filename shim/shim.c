@@ -759,6 +759,51 @@ void shim_main(uint64_t dtb)
 		__asm__ volatile("wfe");
 #endif
 
+#ifdef K60_RSCPROBE
+	{
+		/* Can the shim read the RSC before XNU takes over? XNU dies on the
+		 * first read of 0x17a00000, so this answers whether the block is
+		 * reachable at all or only once some owner has been set up. */
+		/* RSC is unreachable (AOP never grants the AP its XPU), so vote the
+		 * touch rails straight over SPMI: PM8350C LDO2 is periph 0x41 on SID 2.
+		 * QPNP APID: bit27 R/W, bits19-16 data high nibble, bits11-4 register,
+		 * bits3-0 data low nibble. */
+		const uint32_t CORE = 0x0c400000UL, OBS = 0x0c440000UL;
+		uint32_t total = (rd32(CORE + 0x04) & 0x3ffu) + (rd32(CORE + 0x08) & 0x3ffu);
+		int apid = -1; uint32_t ppid = 0;
+		for (uint32_t i = 0; i < total && i < 1024; i++) {
+			uint32_t m = rd32(CORE + 0x900u + 4u * i);
+			if (!m) continue;
+			uint32_t p = (m >> 8) & 0xfffu;
+			if ((p >> 8) == 2 && (p & 0xff) == 0x41) { apid = (int)i; ppid = p; break; }
+		}
+		con_clear(0x00101420);
+		con_banner("ios-sweet", "ldoc2 over SPMI", 0xff5f87d7U, 0x00101420, 3);
+		con_skip();
+		con_hex2("ldoc2 apid", "i=", (uint32_t)(apid < 0 ? 0xffff : apid), "ppid", ppid);
+		if (apid >= 0) {
+			uint32_t off = OBS + 0x20u * (uint32_t)apid;
+			uint32_t en = (uint32_t)(ppid & 0xff) + 0x46u;
+			uint32_t cmd_r = (1u << 27) | ((en & 0xffu) << 4);
+			uint32_t st = 0, val = 0;
+			wr32(off + 0x18, 0);
+			wr32(off + 0x00, cmd_r);
+			__asm__ volatile("dsb sy" ::: "memory");
+			for (unsigned w = 0; w < 2000; w++) { st = rd32(off + 0x08); if (st & 1u) { val = rd32(off + 0x18); break; } }
+			con_hex2("ldoc2 en before", "s=", st, "v", val & 0xffu);
+			/* write 0x80 (enable) */
+			uint32_t cmd_w = ((0x8u) << 16) | ((en & 0xffu) << 4) | 0x0u;
+			wr32(off + 0x18, 0);
+			wr32(off + 0x00, cmd_w);
+			__asm__ volatile("dsb sy" ::: "memory");
+			st = 0; val = 0;
+			for (unsigned w = 0; w < 2000; w++) { st = rd32(off + 0x08); if (st & 1u) { val = rd32(off + 0x18); break; } }
+			con_hex2("ldoc2 en after", "s=", st, "v", val & 0xffu);
+		}
+		report_at(35000);
+	}
+#endif
+
 #if defined(K60_SCREENTEST)
 	{
 		/* Is the panel really driven by our framebuffer writes?
