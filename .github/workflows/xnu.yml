@@ -86,7 +86,10 @@ jobs:
 
       - name: Deps
         run: |
-          brew install jq gum bash cmake ninja
+          brew install jq gum bash cmake ninja python@3.11
+          # xnu's lldbmacros are py_compile'd with python3; 3.12+ rejects their tabs
+          mkdir -p "$HOME/py311" && ln -sf /opt/homebrew/opt/python@3.11/bin/python3.11 "$HOME/py311/python3"
+          echo "$HOME/py311" >> "$GITHUB_PATH"
           # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
