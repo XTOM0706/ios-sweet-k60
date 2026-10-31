@@ -47,9 +47,13 @@ PY
 
 # K60_CMDLINE_EXTRA：追加到标准 cmdline 后（例如 "sweetadreno=1"），
 # 不要覆盖已有参数，只做空格拼接。
+#
+# sweettouchoff=1 必须有：bsd/dev/sweet_touch.c 是给另一颗 SoC 的 SE7 + GENI
+# I2C 写的，在 K60 上开机会在 "SWEET TOUCH: gcc probe vote read" 之后整机死。
+# 0219 的注释写着"默认由 sweettouchoff=1 关着"，但脚本里从来没真的加上。
 EXTRA=${K60_CMDLINE_EXTRA:-}
 python3 "$HACKIO/ios-sweet/tools/mkpayload.py" "$KERNEL" "$ADT" "$PAYLOAD" \
-    --cmdline "debug=0x8 keepsyms=1 cpus=8 -noprogress serial=1 sweet_notests=1 rd=ufsroot0 ufsroot=userdata ufsrw=1 amfi_get_out_of_my_way=1 cs_enforcement_disable=1 amfi_allow_any_signature=1 ufslogsecs=5${EXTRA:+ $EXTRA}" >/dev/null
+    --cmdline "debug=0x8 keepsyms=1 cpus=8 -noprogress serial=1 sweet_notests=1 rd=ufsroot0 ufsroot=userdata ufsrw=1 amfi_get_out_of_my_way=1 cs_enforcement_disable=1 amfi_allow_any_signature=1 ufslogsecs=5 sweettouchoff=1${EXTRA:+ $EXTRA}" >/dev/null
 [ -n "$EXTRA" ] && echo "cmdline extra: $EXTRA"
 
 cd "$HACKIO/ios-sweet/shim"
