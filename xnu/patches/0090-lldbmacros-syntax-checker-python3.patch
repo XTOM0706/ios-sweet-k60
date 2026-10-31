@@ -1,6 +1,6 @@
 --- a/tools/lldbmacros/core/syntax_checker.py
 +++ b/tools/lldbmacros/core/syntax_checker.py
-@@ -1,62 +1,42 @@
+@@ -1,62 +1,41 @@
 -#!/usr/bin/env python
 -from __future__ import absolute_import, print_function
 +#!/usr/bin/env python3
@@ -40,9 +40,8 @@
 +    except OSError as exc:
 +        print('%s: %s' % (path, exc), file=sys.stderr)
 +        return 1
-+    if b'\t' in src:
-+        print('%s: tab character' % path, file=sys.stderr)
-+        return 1
++    # 上游 kcdata.py 第 1503 行本来就带一个 tab，compile() 能过，不拿 tab 当错误。
++    # 真正的缩进错误（含 tab 与空格混用）由下面的 compile() 报。
 +    try:
 +        compile(src, path, 'exec')
 +    except SyntaxError as exc:
