@@ -56,7 +56,7 @@ diff --git a/bsd/dev/k60_touch_geni.c b/bsd/dev/k60_touch_geni.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_touch_geni.c
-@@ -0,0 +1,591 @@
+@@ -0,0 +1,595 @@
 +/*
 + * K60（mondrian，SM8475）触摸：GCC 时钟与 QUPv3 SE4 上的 GENI SPI。
 + *
@@ -565,10 +565,6 @@ new file mode 100644
 +		*problem = "se4 has no SPI firmware";
 +		return -1;
 +	}
-+	if (K60_TOUCH_RD(k60_se + K60_SE_IF_DISABLE_RO) & 1u) {
-+		*problem = "se4 FIFO interface is disabled";
-+		return -1;
-+	}
 +	depth = (K60_TOUCH_RD(k60_se + K60_SE_HW_PARAM_0) >> 16) & 0x3fu;
 +	if (depth < 4) {
 +		*problem = "se4 reports no FIFO";
@@ -589,6 +585,14 @@ new file mode 100644
 +	K60_TOUCH_WR(k60_se + K60_SE_FORCE_DEFAULT, 1);
 +	K60_TOUCH_WR(k60_se + K60_SE_DMA_MODE_EN,
 +	    K60_TOUCH_RD(k60_se + K60_SE_DMA_MODE_EN) & ~1u);
++	/*
++	 * IF_DISABLE_RO 在 DMA 模式还开着的时候是置位的，先把 DMA 关掉再读。
++	 * 上机日志是之前先读到它、于是停在 FIFO 判据上，其实再走两步就清了。
++	 */
++	printf("K60 TOUCH: geni if_disable_ro %#x dma_mode %#x\n",
++	    K60_TOUCH_RD(k60_se + K60_SE_IF_DISABLE_RO),
++	    K60_TOUCH_RD(k60_se + K60_SE_DMA_MODE_EN));
++	k60_touch_flush();
 +	K60_TOUCH_WR(k60_se + K60_SE_RX_WATERMARK, depth - 3);
 +	K60_TOUCH_WR(k60_se + K60_SE_RX_RFR_WATERMARK, depth - 2);
 +	K60_TOUCH_WR(k60_se + K60_SE_TX_WATERMARK, 0);
