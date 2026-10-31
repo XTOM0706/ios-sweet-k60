@@ -248,7 +248,7 @@ diff --git a/bsd/dev/k60_keys.c b/bsd/dev/k60_keys.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_keys.c
-@@ -0,0 +1,560 @@
+@@ -0,0 +1,563 @@
 +/*
 + * K60（mondrian，SM8475）物理按键：PON 的电源键/音量减 + PMIC GPIO 的音量加。
 + *
@@ -293,6 +293,9 @@ new file mode 100644
 +#include <machine/machine_routines.h>
 +
 +#include "sweet_spmi.h"			/* sweet_spmi_init()/sweet_spmi_read() */
++
++/* machine_routines.h 不导出它；k60_touch_geni.c 里也是自己声明的。 */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +
 +extern void sweet_hid_key(int key, int down);
 +extern void sweet_log_flush_now(void);
