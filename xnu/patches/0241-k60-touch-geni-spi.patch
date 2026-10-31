@@ -56,7 +56,7 @@ diff --git a/bsd/dev/k60_touch_geni.c b/bsd/dev/k60_touch_geni.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_touch_geni.c
-@@ -0,0 +1,682 @@
+@@ -0,0 +1,684 @@
 +/*
 + * K60（mondrian，SM8475）触摸：GCC 时钟与 QUPv3 SE4 上的 GENI SPI。
 + *
@@ -139,6 +139,7 @@ new file mode 100644
 +#define K60_SE_CGC_CTRL		0x028u
 +#define K60_SE_STATUS		0x040u	/* bit0：有命令在跑 */
 +#define K60_SE_SER_M_CLK_CFG	0x048u	/* bit0 使能、[15:4] 分频 */
++#define K60_SE_IF_DISABLE_RO	0x064u	/* bit0=1 表示 FIFO 接口是关的（只读） */
 +#define K60_SE_CLK_CTRL_RO	0x060u	/* 只读的时钟状态 */
 +#define K60_SE_GENI_CLK_CTRL	0x2000u	/* bit0 SER_CLK_SEL：串行时钟选择 */
 +#define K60_SE_DMA_IF_EN	0x2004u	/* bit0：DMA 接口使能 */
@@ -543,7 +544,6 @@ new file mode 100644
 + * 把 SE4 配成 SPI。只写 GENI 的配置寄存器，不碰固件（固件是引导装载程序
 + * 装进去的）。返回 0 或一个可以打进日志的原因字符串。
 + */
-+int
 +/* ---- 手工 SPI（k60touchbb=1） ---------------------------------------------------------
 + * 这颗 SE 的 FIFO 接口是关着的，而打开它的 SE_FIFO_IF_DISABLE 在 0x2008 那页
 + * 寄存器上 —— 那页一读就挂总线（0x1000 那次已经挂过一回）。GENI 这条先放一边，
@@ -553,31 +553,6 @@ new file mode 100644
 +static void
 +k60_bb_edge(uint32_t pin, int level)
 +{
-+	k60_bb_mode = 0;
-+	(void)PE_parse_boot_argn("k60touchbb", &k60_bb_mode, sizeof(k60_bb_mode));
-+	if (k60_bb_mode != 0) {
-+		uint32_t level = 1;
-+
-+		/* CS 空闲高、CLK 低、MOSI 低，MISO 留成输入。 */
-+		if (k60_touch_pin_output(K60_TOUCH_GPIO_CS, 1,
-+		    K60_TOUCH_PIN_PULL_UP, K60_TOUCH_PIN_DRIVE_8MA) != 0 ||
-+		    k60_touch_pin_output(K60_TOUCH_GPIO_CLK, 0,
-+		    K60_TOUCH_PIN_PULL_NONE, K60_TOUCH_PIN_DRIVE_8MA) != 0 ||
-+		    k60_touch_pin_output(K60_TOUCH_GPIO_MOSI, 0,
-+		    K60_TOUCH_PIN_PULL_NONE, K60_TOUCH_PIN_DRIVE_8MA) != 0 ||
-+		    k60_touch_pin_config(K60_TOUCH_GPIO_MISO,
-+		    K60_TOUCH_PIN_FUNC_GPIO, K60_TOUCH_PIN_PULL_NONE,
-+		    K60_TOUCH_PIN_DRIVE_8MA, 0) != 0) {
-+			*problem = "bit-bang pins do not take gpio";
-+			return -1;
-+		}
-+		(void)k60_touch_pin_level(K60_TOUCH_GPIO_CS, &level);
-+		printf("K60 TOUCH: stage 4b: bit-banged SPI on gpio16-19, cs %u\n",
-+		    level);
-+		k60_touch_flush();
-+		*problem = NULL;
-+		return 0;
-+	}
 +	(void)k60_touch_pin_output(pin, level, K60_TOUCH_PIN_PULL_NONE,
 +	    K60_TOUCH_PIN_DRIVE_8MA);
 +	delay(1);
@@ -610,6 +585,8 @@ new file mode 100644
 +	}
 +	k60_bb_edge(K60_TOUCH_GPIO_CS, 1);
 +}
++
++int
 +k60_touch_geni_bringup(uint32_t hz, const char **problem)
 +{
 +	static const uint32_t spi_pins[4] = {
@@ -617,7 +594,32 @@ new file mode 100644
 +		K60_TOUCH_GPIO_MISO, K60_TOUCH_GPIO_CS,
 +	};
 +	uint32_t fw, depth, divider, mclk;
++	uint32_t level = 1;
 +	unsigned i;
++
++	k60_bb_mode = 0;
++	(void)PE_parse_boot_argn("k60touchbb", &k60_bb_mode, sizeof(k60_bb_mode));
++	if (k60_bb_mode != 0) {
++		/* CS 空闲高、CLK 低、MOSI 低，MISO 留成输入。 */
++		if (k60_touch_pin_output(K60_TOUCH_GPIO_CS, 1,
++		    K60_TOUCH_PIN_PULL_UP, K60_TOUCH_PIN_DRIVE_8MA) != 0 ||
++		    k60_touch_pin_output(K60_TOUCH_GPIO_CLK, 0,
++		    K60_TOUCH_PIN_PULL_NONE, K60_TOUCH_PIN_DRIVE_8MA) != 0 ||
++		    k60_touch_pin_output(K60_TOUCH_GPIO_MOSI, 0,
++		    K60_TOUCH_PIN_PULL_NONE, K60_TOUCH_PIN_DRIVE_8MA) != 0 ||
++		    k60_touch_pin_config(K60_TOUCH_GPIO_MISO,
++		    K60_TOUCH_PIN_FUNC_GPIO, K60_TOUCH_PIN_PULL_NONE,
++		    K60_TOUCH_PIN_DRIVE_8MA, 0) != 0) {
++			*problem = "bit-bang pins do not take gpio";
++			return -1;
++		}
++		(void)k60_touch_pin_level(K60_TOUCH_GPIO_CS, &level);
++		printf("K60 TOUCH: stage 4b: bit-banged SPI on gpio16-19, cs %u\n",
++		    level);
++		k60_touch_flush();
++		*problem = NULL;
++		return 0;
++	}
 +
 +	*problem = "unknown";
 +	printf("K60 TOUCH: stage 4: se4 %#lx, spi up to %u Hz\n",
@@ -739,6 +741,7 @@ new file mode 100644
 +}
 +
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
