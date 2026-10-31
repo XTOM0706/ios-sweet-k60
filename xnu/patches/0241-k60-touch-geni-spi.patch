@@ -56,7 +56,7 @@ diff --git a/bsd/dev/k60_touch_geni.c b/bsd/dev/k60_touch_geni.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_touch_geni.c
-@@ -0,0 +1,604 @@
+@@ -0,0 +1,616 @@
 +/*
 + * K60（mondrian，SM8475）触摸：GCC 时钟与 QUPv3 SE4 上的 GENI SPI。
 + *
@@ -139,7 +139,10 @@ new file mode 100644
 +#define K60_SE_CGC_CTRL		0x028u
 +#define K60_SE_STATUS		0x040u	/* bit0：有命令在跑 */
 +#define K60_SE_SER_M_CLK_CFG	0x048u	/* bit0 使能、[15:4] 分频 */
-+#define K60_SE_IF_DISABLE_RO	0x064u
++#define K60_SE_CLK_CTRL_RO	0x060u	/* 只读的时钟状态 */
++#define K60_SE_GENI_CLK_CTRL	0x2000u	/* bit0 SER_CLK_SEL：串行时钟选择 */
++#define K60_SE_DMA_IF_EN	0x2004u	/* bit0：DMA 接口使能 */
++#define K60_SE_FIFO_IF_DISABLE	0x2008u	/* bit0：FIFO 接口禁用，要清掉 */
 +#define K60_SE_FW_REVISION_RO	0x068u	/* [15:8] 协议：1 = SPI */
 +#define K60_SE_CLK_SEL		0x07cu
 +#define K60_SE_SPI_CPHA		0x224u
@@ -586,12 +589,13 @@ new file mode 100644
 +	K60_TOUCH_WR(k60_se + K60_SE_DMA_MODE_EN,
 +	    K60_TOUCH_RD(k60_se + K60_SE_DMA_MODE_EN) & ~1u);
 +	/*
-+	 * IF_DISABLE_RO 在 DMA 模式还开着的时候是置位的，先把 DMA 关掉再读。
-+	 * 上机日志是之前先读到它、于是停在 FIFO 判据上，其实再走两步就清了。
++	 * FIFO 接口的开关是 0x2008（可写，bit0=禁用），不是 0x64 —— 0x64 在这版
++	 * GENI 里是只读状态寄存器。旧代码把它当判据，读出来恒为 1 就永远停在这。
 +	 */
-+	printf("K60 TOUCH: geni if_disable_ro %#x dma_mode %#x\n",
-+	    K60_TOUCH_RD(k60_se + K60_SE_IF_DISABLE_RO),
-+	    K60_TOUCH_RD(k60_se + K60_SE_DMA_MODE_EN));
++	printf("K60 TOUCH: geni pre fifo_dis %#x clk_ctrl %#x clk_ro %#x\n",
++	    K60_TOUCH_RD(k60_se + K60_SE_FIFO_IF_DISABLE),
++	    K60_TOUCH_RD(k60_se + K60_SE_GENI_CLK_CTRL),
++	    K60_TOUCH_RD(k60_se + K60_SE_CLK_CTRL_RO));
 +	k60_touch_flush();
 +	K60_TOUCH_WR(k60_se + K60_SE_RX_WATERMARK, depth - 3);
 +	K60_TOUCH_WR(k60_se + K60_SE_RX_RFR_WATERMARK, depth - 2);
@@ -652,8 +656,16 @@ new file mode 100644
 +	printf("K60 TOUCH: se4 status %#x fifo %u words\n",
 +	    K60_TOUCH_RD(k60_se + K60_SE_STATUS), k60_fifo_depth);
 +	k60_touch_flush();
-+	printf("K60 TOUCH: geni if_disable_ro %#x after setup, mclk %#x\n",
-+	    K60_TOUCH_RD(k60_se + K60_SE_IF_DISABLE_RO),
++	/* 串行时钟选择 + 打开 FIFO 接口、关掉 DMA 接口（Linux 的 select_fifo_mode 同款）。 */
++	K60_TOUCH_WR(k60_se + K60_SE_GENI_CLK_CTRL,
++	    K60_TOUCH_RD(k60_se + K60_SE_GENI_CLK_CTRL) | 1u);
++	K60_TOUCH_WR(k60_se + K60_SE_DMA_IF_EN,
++	    K60_TOUCH_RD(k60_se + K60_SE_DMA_IF_EN) & ~1u);
++	K60_TOUCH_WR(k60_se + K60_SE_FIFO_IF_DISABLE,
++	    K60_TOUCH_RD(k60_se + K60_SE_FIFO_IF_DISABLE) & ~1u);
++	printf("K60 TOUCH: geni fifo_dis %#x clk_ctrl %#x mclk %#x after setup\n",
++	    K60_TOUCH_RD(k60_se + K60_SE_FIFO_IF_DISABLE),
++	    K60_TOUCH_RD(k60_se + K60_SE_GENI_CLK_CTRL),
 +	    K60_TOUCH_RD(k60_se + K60_SE_SER_M_CLK_CFG));
 +	k60_touch_flush();
 +	*problem = NULL;
