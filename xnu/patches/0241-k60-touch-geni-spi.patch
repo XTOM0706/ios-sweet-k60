@@ -56,7 +56,7 @@ diff --git a/bsd/dev/k60_touch_geni.c b/bsd/dev/k60_touch_geni.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_touch_geni.c
-@@ -0,0 +1,595 @@
+@@ -0,0 +1,604 @@
 +/*
 + * K60（mondrian，SM8475）触摸：GCC 时钟与 QUPv3 SE4 上的 GENI SPI。
 + *
@@ -597,11 +597,16 @@ new file mode 100644
 +	K60_TOUCH_WR(k60_se + K60_SE_RX_RFR_WATERMARK, depth - 2);
 +	K60_TOUCH_WR(k60_se + K60_SE_TX_WATERMARK, 0);
 +	/*
-+	 * 中断全程屏蔽：这里只轮询，GIC SPI 605 没有人认领，使能了就是一条
-+	 * 永远没人处理的中断。状态位不受它影响。
++	/*
++	 * 状态位要跟着使能位才会置起来：这两组清零的话，M_IRQ_STATUS 永远是 0，
++	 * 传输就会一直轮询到超时（上机日志里 status 0、sent 36、received 0 就是
++	 * 这个）。pong 那边写的是 SE_IRQ_EN |= 0xf、M_IRQ_EN |= 0x7fc0007f；
++	 * GIC 的 SPI 605 我们不使能，所以不会有中断真的打到 CPU。
 +	 */
-+	K60_TOUCH_WR(k60_se + K60_SE_IRQ_EN, 0);
-+	K60_TOUCH_WR(k60_se + K60_SE_M_IRQ_EN, 0);
++	K60_TOUCH_WR(k60_se + K60_SE_IRQ_EN,
++	    K60_TOUCH_RD(k60_se + K60_SE_IRQ_EN) | 0xfu);
++	K60_TOUCH_WR(k60_se + K60_SE_M_IRQ_EN,
++	    K60_TOUCH_RD(k60_se + K60_SE_M_IRQ_EN) | 0x7fc0007fu);
 +
 +	/* 模式 0、CS0、8 位、MSB 先、四个字节一个 FIFO 字。 */
 +	K60_TOUCH_WR(k60_se + K60_SE_SPI_LOOPBACK, 0);
@@ -646,6 +651,10 @@ new file mode 100644
 +	    k60_se_source_hz, divider);
 +	printf("K60 TOUCH: se4 status %#x fifo %u words\n",
 +	    K60_TOUCH_RD(k60_se + K60_SE_STATUS), k60_fifo_depth);
++	k60_touch_flush();
++	printf("K60 TOUCH: geni if_disable_ro %#x after setup, mclk %#x\n",
++	    K60_TOUCH_RD(k60_se + K60_SE_IF_DISABLE_RO),
++	    K60_TOUCH_RD(k60_se + K60_SE_SER_M_CLK_CFG));
 +	k60_touch_flush();
 +	*problem = NULL;
 +	return 0;
