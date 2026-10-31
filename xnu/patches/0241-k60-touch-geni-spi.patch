@@ -100,23 +100,23 @@ new file mode 100644
 +/* ---- GCC ------------------------------------------------------------------ */
 +
 +#define K60_GCC_VOTE		0x62008u
-+#define K60_GCC_VOTE_M_AHB	(1u << 20)
-+#define K60_GCC_VOTE_S_AHB	(1u << 21)
-+#define K60_GCC_VOTE_CORE	(1u << 19)
-+#define K60_GCC_VOTE_CORE_2X	(1u << 18)
-+#define K60_GCC_VOTE_SE4	(1u << 26)
-+/* The five branches gcc-sm8450.c enables for QUPV3 wrap 1. */
++#define K60_GCC_VOTE_M_AHB	(1u << 6)
++#define K60_GCC_VOTE_S_AHB	(1u << 7)
++#define K60_GCC_VOTE_CORE	(1u << 8)
++#define K60_GCC_VOTE_CORE_2X	(1u << 9)
++#define K60_GCC_VOTE_SE4	(1u << 14)
++/* The five branches gcc-sm8450.c enables for QUPV3 wrap 0 (SE4 @ 0x990000). */
 +#define K60_GCC_VOTE_MASK	(K60_GCC_VOTE_M_AHB | K60_GCC_VOTE_S_AHB | \
 +				 K60_GCC_VOTE_CORE | K60_GCC_VOTE_CORE_2X | \
 +				 K60_GCC_VOTE_SE4)
 +
-+#define K60_GCC_CORE_2X_HALT	0x3314cu
-+#define K60_GCC_CORE_HALT	0x33140u
-+#define K60_GCC_M_AHB_HALT	0x28004u
-+#define K60_GCC_S_AHB_HALT	0x28008u
-+#define K60_GCC_SE4_HALT	0x284dcu
-+#define K60_GCC_SE4_CMD		0x284e4u
-+#define K60_GCC_SE4_CFG		0x284e8u
++#define K60_GCC_CORE_2X_HALT	0x3300cu
++#define K60_GCC_CORE_HALT	0x33000u
++#define K60_GCC_M_AHB_HALT	0x27004u
++#define K60_GCC_S_AHB_HALT	0x27008u
++#define K60_GCC_SE4_HALT	0x274dcu
++#define K60_GCC_SE4_CMD		0x274e4u
++#define K60_GCC_SE4_CFG		0x274e8u
 +
 +#define K60_RCG_UPDATE		(1u << 0)
 +#define K60_RCG_ROOT_EN		(1u << 1)
@@ -237,7 +237,7 @@ new file mode 100644
 +	printf("K60 TOUCH: gcc vote %#x -> %#x, bits %#x\n", before, after,
 +	    after & K60_GCC_VOTE_MASK);
 +	for (i = 0; i < 5; i++) {
-+		static const uint32_t bit[5] = { 18, 19, 20, 21, 26 };
++		static const uint32_t bit[5] = { 6, 7, 8, 9, 14 };
 +		uint32_t on = (after >> bit[i]) & 1u;
 +
 +		printf("K60 TOUCH: gcc vote bit%u on=%u\n", bit[i], on);
