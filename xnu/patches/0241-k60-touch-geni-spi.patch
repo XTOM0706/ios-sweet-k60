@@ -56,7 +56,7 @@ diff --git a/bsd/dev/k60_touch_geni.c b/bsd/dev/k60_touch_geni.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_touch_geni.c
-@@ -0,0 +1,516 @@
+@@ -0,0 +1,540 @@
 +/*
 + * K60（mondrian，SM8475）触摸：GCC 时钟与 QUPv3 SE4 上的 GENI SPI。
 + *
@@ -216,7 +216,7 @@ new file mode 100644
 +int
 +k60_touch_clocks_on(void)
 +{
-+	uint32_t before, after, cmd, cfg, halt_m, halt_s, halt_se, halt_c, halt_c2;
++	uint32_t before, after, cmd, cfg, dfs, halt_m, halt_s, halt_se, halt_c, halt_c2;
 +	unsigned i, missed = 0;
 +
 +	printf("K60 TOUCH: stage 3: gcc %#lx window %#lx, no SE access yet\n",
@@ -252,6 +252,70 @@ new file mode 100644
 +		return -1;
 +	}
 +
++	/*
++	 * 0x62008 的投票只是"允许时钟开"，真正把分支打开的是 CBCR 的 bit0
++	 * （Linux 的 clk_branch_toggle 写的就是这一位）。不写它，分支一直是
++	 * halt 的，bit31 读回来还立着。
++	 */
++	{
++		static const uint32_t br[5] = {
++			K60_GCC_M_AHB_HALT, K60_GCC_S_AHB_HALT,
++			K60_GCC_SE4_HALT, K60_GCC_CORE_HALT,
++			K60_GCC_CORE_2X_HALT
++		};
+
++		for (i = 0; i < 5; i++) {
++			K60_TOUCH_WR(k60_gcc + br[i],
++			    K60_TOUCH_RD(k60_gcc + br[i]) | 1u);
++		}
++	}
++	printf("K60 TOUCH: gcc branch bit0 written (m/s/se/c/c2)\n");
++	k60_touch_flush();
+
++	/*
++	 * SE4 的根时钟。ROOT_EN 没立就等于根没开，分支再怎么投票也是 halt。
++	 * cfg 只在 dfs 关着的时候才动：DFS 表不在我们手里，改错直接把根弄死。
++	 */
++	cmd = K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CMD);
++	cfg = K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CFG);
++	dfs = K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CMD + 0x14u);
++	printf("K60 TOUCH: gcc se4 root cmd %#x cfg %#x dfs %#x\n", cmd, cfg,
++	    dfs);
++	k60_touch_flush();
++	if ((cmd & K60_RCG_ROOT_EN) == 0) {
++		if (dfs & 1u) {
++			printf("K60 TOUCH: se4 dfs on, leaving cfg %#x\n", cfg);
++			k60_touch_flush();
++		} else {
++			/* 选 XO、不分频（CFG 的 [10:8]=0、[4:0]=0）。 */
++			K60_TOUCH_WR(k60_gcc + K60_GCC_SE4_CFG,
++			    cfg & ~(K60_RCG_SRC_MASK | K60_RCG_DIV_MASK |
++			    K60_RCG_MODE_MASK));
++		}
++		K60_TOUCH_WR(k60_gcc + K60_GCC_SE4_CMD, K60_RCG_UPDATE);
++		for (i = 0; i < 1000; i++) {
++			if (!(K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CMD) &
++			    K60_RCG_UPDATE)) {
++				break;
++			}
++			delay(10);
++		}
++		if (i == 1000) {
++			printf("K60 TOUCH: gcc se4 update timed out, cmd %#x\n",
++			    K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CMD));
++			k60_touch_flush();
++			return -1;
++		}
++		K60_TOUCH_WR(k60_gcc + K60_GCC_SE4_CMD, K60_RCG_ROOT_EN);
++		delay(1000);
++		printf("K60 TOUCH: gcc se4 root enabled, now cmd %#x cfg %#x\n",
++		    K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CMD),
++		    K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CFG));
++		k60_touch_flush();
++		cfg = K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CFG);
++	}
++	k60_se_source_hz = k60_se_source(cfg);
+
 +	/* 分支 CBCR/HALT：bit31 清掉才是真的开着。 */
 +	for (i = 0; i < 1000; i++) {
 +		halt_m = K60_TOUCH_RD(k60_gcc + K60_GCC_M_AHB_HALT);
@@ -273,43 +337,6 @@ new file mode 100644
 +	printf("K60 TOUCH: gcc halt m/s/se/c/c2 %#x/%#x/%#x/%#x/%#x\n",
 +	    halt_m, halt_s, halt_se, halt_c, halt_c2);
 +	k60_touch_flush();
-+
-+	/*
-+	 * SE4 的根时钟。已经开着就只解码父源（供 SER 分频用），不重配：
-+	 * 引导装载程序可能给了 100 MHz，改错反而把 SE 的时钟弄没。
-+	 */
-+	cmd = K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CMD);
-+	cfg = K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CFG);
-+	printf("K60 TOUCH: gcc se4 root cmd %#x cfg %#x\n", cmd, cfg);
-+	k60_touch_flush();
-+	if (cmd & K60_RCG_ROOT_OFF) {
-+		/* 选 XO、不分频（CFG 的 [10:8]=0、[4:0]=0），再 UPDATE、ROOT_EN。 */
-+		K60_TOUCH_WR(k60_gcc + K60_GCC_SE4_CFG,
-+		    cfg & ~(K60_RCG_SRC_MASK | K60_RCG_DIV_MASK |
-+		    K60_RCG_MODE_MASK));
-+		K60_TOUCH_WR(k60_gcc + K60_GCC_SE4_CMD, K60_RCG_UPDATE);
-+		for (i = 0; i < 1000; i++) {
-+			if (!(K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CMD) &
-+			    K60_RCG_UPDATE)) {
-+				break;
-+			}
-+			delay(10);
-+		}
-+		if (i == 1000) {
-+			printf("K60 TOUCH: gcc se4 update timed out, cmd %#x\n",
-+			    K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CMD));
-+			k60_touch_flush();
-+			return -1;
-+		}
-+		K60_TOUCH_WR(k60_gcc + K60_GCC_SE4_CMD, K60_RCG_ROOT_EN);
-+		delay(1000);
-+		printf("K60 TOUCH: gcc se4 root was off, now cmd %#x cfg %#x\n",
-+		    K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CMD),
-+		    K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CFG));
-+		k60_touch_flush();
-+		cfg = K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CFG);
-+	}
-+	k60_se_source_hz = k60_se_source(cfg);
 +
 +	/*
 +	 * 判据：三条分支的 halt 位都清了才算时钟真的在跑。只要有一条还立着，
