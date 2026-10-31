@@ -56,7 +56,7 @@ diff --git a/bsd/dev/k60_touch_geni.c b/bsd/dev/k60_touch_geni.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_touch_geni.c
-@@ -0,0 +1,573 @@
+@@ -0,0 +1,591 @@
 +/*
 + * K60（mondrian，SM8475）触摸：GCC 时钟与 QUPv3 SE4 上的 GENI SPI。
 + *
@@ -126,6 +126,7 @@ new file mode 100644
 +#define K60_RCG_DIV_MASK	0x1fu
 +#define K60_RCG_MODE_MASK	(3u << 12)
 +#define K60_CLOCK_OFF		(1u << 31)
++#define K60_HWCG_BIT		(1u << 1)	/* CBCR 的 hwcg 位：开着时 halt 不可信 */
 +
 +#define K60_XO_HZ		19200000u
 +#define K60_GPLL0_MAIN_HZ	600000000u
@@ -216,7 +217,7 @@ new file mode 100644
 +int
 +k60_touch_clocks_on(void)
 +{
-+	uint32_t before, after, cmd, cfg, dfs, halt_m, halt_s, halt_se, halt_c, halt_c2;
++	uint32_t before, after, cmd, cfg, dfs, halt_m, halt_s, halt_se, halt_c, halt_c2, halt_bad;
 +	unsigned i, missed = 0;
 +
 +	printf("K60 TOUCH: stage 3: gcc %#lx window %#lx, no SE access yet\n",
@@ -373,9 +374,26 @@ new file mode 100644
 +	 * 就停在 GENI 之前 —— 带着没起来的时钟去读 SE 是这一步唯一会把整机
 +	 * 挂住的操作。
 +	 */
-+	if ((halt_m | halt_s | halt_se) & K60_CLOCK_OFF) {
-+		printf("K60 TOUCH: clocks not ready (m/s/se %#x/%#x/%#x), "
-+		    "stopping before SE\n", halt_m, halt_s, halt_se);
++	/*
++	 * HWCG（硬件自动门控）开着时，空闲的时钟本来就读成 CLK_OFF，这不代表
++	 * 没开 —— Linux 的 clk_branch_in_hwcg_mode() 同样让 halt 检查直接放过。
++	 * 上机日志里 s_ahb 读 0x80000002，bit1 正是 hwcg 位。
++	 */
++	halt_bad = 0;
++	if (!(halt_m & K60_HWCG_BIT) && (halt_m & K60_CLOCK_OFF)) {
++		halt_bad |= 1;
++	}
++	if (!(halt_s & K60_HWCG_BIT) && (halt_s & K60_CLOCK_OFF)) {
++		halt_bad |= 2;
++	}
++	if (!(halt_se & K60_HWCG_BIT) && (halt_se & K60_CLOCK_OFF)) {
++		halt_bad |= 4;
++	}
++	if (halt_bad != 0) {
++		printf("K60 TOUCH: clocks not ready (m/s/se %#x/%#x/%#x, hwcg "
++		    "%u/%u/%u, bad %u), stopping before SE\n", halt_m, halt_s,
++		    halt_se, !!(halt_m & K60_HWCG_BIT), !!(halt_s & K60_HWCG_BIT),
++		    !!(halt_se & K60_HWCG_BIT), halt_bad);
 +		k60_touch_flush();
 +		return -1;
 +	}
