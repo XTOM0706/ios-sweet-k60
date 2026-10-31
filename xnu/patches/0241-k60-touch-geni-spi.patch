@@ -56,7 +56,7 @@ diff --git a/bsd/dev/k60_touch_geni.c b/bsd/dev/k60_touch_geni.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_touch_geni.c
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,573 @@
 +/*
 + * K60（mondrian，SM8475）触摸：GCC 时钟与 QUPv3 SE4 上的 GENI SPI。
 + *
@@ -270,6 +270,36 @@ new file mode 100644
 +		}
 +	}
 +	printf("K60 TOUCH: gcc branch bit0 written (m/s/se/c/c2)\n");
++	k60_touch_flush();
++	/*
++	 * 只读快照：这几组窗口回读出来的东西要能看出寄存器是活的还是死的。
++	 * 0x62000 组当对照 —— 那个窗口的读写在投票位上是有效的。
++	 */
++	printf("K60 TOUCH: gcc dump 27000:");
++	for (i = 0; i < 6; i++) {
++		printf(" %#x", K60_TOUCH_RD(k60_gcc + 0x27000u + i * 4u));
++	}
++	printf(" 274d0:");
++	for (i = 0; i < 11; i++) {
++		printf(" %#x", K60_TOUCH_RD(k60_gcc + 0x274d0u + i * 4u));
++	}
++	printf("\n");
++	k60_touch_flush();
++	printf("K60 TOUCH: gcc dump 33000:");
++	for (i = 0; i < 6; i++) {
++		printf(" %#x", K60_TOUCH_RD(k60_gcc + 0x33000u + i * 4u));
++	}
++	printf(" 62000:");
++	for (i = 0; i < 6; i++) {
++		printf(" %#x", K60_TOUCH_RD(k60_gcc + 0x62000u + i * 4u));
++	}
++	printf("\n");
++	k60_touch_flush();
++	/* bit0 写下去能不能读回来：读 0x27004 与写后回读对照。 */
++	K60_TOUCH_WR(k60_gcc + K60_GCC_M_AHB_HALT,
++	    K60_TOUCH_RD(k60_gcc + K60_GCC_M_AHB_HALT) | 1u);
++	printf("K60 TOUCH: m_ahb after write bit0 %#x\n",
++	    K60_TOUCH_RD(k60_gcc + K60_GCC_M_AHB_HALT));
 +	k60_touch_flush();
 +
 +	/*
