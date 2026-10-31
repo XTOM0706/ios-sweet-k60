@@ -6,8 +6,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: echo alive && uname -a
-  mac13:
-    runs-on: macos-13
+  mac14:
+    runs-on: macos-14
     steps:
       - run: sw_vers && xcodebuild -version && ls -d /Applications/Xcode*.app
   mac15:
