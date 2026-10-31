@@ -132,7 +132,21 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee build.log
+
+      - name: Fail on skipped patches
+        if: always()
+        run: |
+          # build.sh 对 git apply 失败的补丁只打印 warning 就跳过，构建照样"成功"，
+          # 于是内核缺一整段功能还看不出来。这里把它变成硬失败。
+          if grep -q 'Skipping patch' dxb/build.log 2>/dev/null; then
+            echo "::error::some patches were skipped"
+            grep -A1 'Skipping patch' dxb/build.log || true
+            exit 1
+          fi
+          echo "all patches applied"
 
       - name: Package build tree for local compiles
         if: always()

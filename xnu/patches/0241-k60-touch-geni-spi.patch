@@ -56,7 +56,7 @@ diff --git a/bsd/dev/k60_touch_geni.c b/bsd/dev/k60_touch_geni.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_touch_geni.c
-@@ -0,0 +1,540 @@
+@@ -0,0 +1,543 @@
 +/*
 + * K60（mondrian，SM8475）触摸：GCC 时钟与 QUPv3 SE4 上的 GENI SPI。
 + *
@@ -263,7 +263,7 @@ new file mode 100644
 +			K60_GCC_SE4_HALT, K60_GCC_CORE_HALT,
 +			K60_GCC_CORE_2X_HALT
 +		};
-
++
 +		for (i = 0; i < 5; i++) {
 +			K60_TOUCH_WR(k60_gcc + br[i],
 +			    K60_TOUCH_RD(k60_gcc + br[i]) | 1u);
@@ -271,7 +271,7 @@ new file mode 100644
 +	}
 +	printf("K60 TOUCH: gcc branch bit0 written (m/s/se/c/c2)\n");
 +	k60_touch_flush();
-
++
 +	/*
 +	 * SE4 的根时钟。ROOT_EN 没立就等于根没开，分支再怎么投票也是 halt。
 +	 * cfg 只在 dfs 关着的时候才动：DFS 表不在我们手里，改错直接把根弄死。
@@ -315,7 +315,7 @@ new file mode 100644
 +		cfg = K60_TOUCH_RD(k60_gcc + K60_GCC_SE4_CFG);
 +	}
 +	k60_se_source_hz = k60_se_source(cfg);
-
++
 +	/* 分支 CBCR/HALT：bit31 清掉才是真的开着。 */
 +	for (i = 0; i < 1000; i++) {
 +		halt_m = K60_TOUCH_RD(k60_gcc + K60_GCC_M_AHB_HALT);
