@@ -1,0 +1,690 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1698081..a254fe4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -56,6 +56,9 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys, vm_size_t size);
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <sys/kauth.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -206,6 +209,285 @@ sweet_fb_geom_map(const struct sweet_fb_geom *g, int32_t lx, int32_t ly,
+ 	}
+ }
+ 
++/*
++ * ===== 壁纸（Plan Z） =====
++ *
++ * 锁屏黑不是因为合成器没工作：壁纸由 PaperBoard 自己的 FBScene 画，是另一个
++ * IOSurface。CPU 合成器只把 SpringBoard 主窗口那块 surface 拷进面板，壁纸层
++ * 从来没到过屏幕上，所以到底是黑的。
++ *
++ * Plan Z：内核自己先铺一张壁纸，再把 SpringBoard 的 surface 用 src-over 叠
++ * 上去（锁屏 UI 是透明的，透出来就是壁纸）。壁纸数据不进 patch：几 MB 的 C
++ * 数组会把 xnu/patches/** 的 CI 缓存键天天打穿，改一张图还要重编内核；改成
++ * 内核从根卷读一个已知路径的裸 BGRA 文件，读不到就维持今天的行为（黑底），
++ * 绝不阻塞启动。
++ */
++#define SWEET_WP_PATH_MAX       192
++#define SWEET_WP_MAX_BYTES      (24u * 1024 * 1024)
++#define SWEET_WP_DEFAULT_PATH   "/private/var/SweetWallpaper.bgra"
++#define SWEET_WP_DEFAULT_W      720
++#define SWEET_WP_DEFAULT_H      1600
++#define SWEET_WP_ALPHA_STEP     32      /* 判断"这层全不透明吗"的采样步长，像素 */
++
++/* 壁纸 -> 面板 的映射。32.32 定点，整数乘加，不查表不分配。 */
++struct sweet_fb_wall {
++	const uint8_t *pixels;          /* BGRA，行优先 */
++	uint32_t width, height, rowBytes;
++	uint64_t stepX, stepY;          /* 面板 1 像素 = 壁纸的多少像素（32.32） */
++};
++
++static void
++sweet_fb_wall_init(struct sweet_fb_wall *w, const uint8_t *pixels, uint32_t width,
++    uint32_t height, uint32_t panelW, uint32_t panelH)
++{
++	bzero(w, sizeof(*w));
++	w->pixels = pixels;
++	w->width = width;
++	w->height = height;
++	w->rowBytes = width * 4;
++	if (pixels == NULL || width == 0 || height == 0 || panelW == 0 || panelH == 0) {
++		return;
++	}
++	w->stepX = ((uint64_t)width << 32) / panelW;
++	w->stepY = ((uint64_t)height << 32) / panelH;
++}
++
++/* 面板 (x,y) 对应的壁纸像素。越界一律夹到最后一列/行，不读出去。 */
++static inline const uint8_t *
++sweet_fb_wall_at(const struct sweet_fb_wall *w, uint32_t x, uint32_t y)
++{
++	uint32_t wx = (uint32_t)(((uint64_t)x * w->stepX) >> 32);
++	uint32_t wy = (uint32_t)(((uint64_t)y * w->stepY) >> 32);
++
++	if (wx >= w->width) {
++		wx = w->width - 1;
++	}
++	if (wy >= w->height) {
++		wy = w->height - 1;
++	}
++	return w->pixels + (uint64_t)wy * w->rowBytes + (uint64_t)wx * 4;
++}
++
++/*
++ * CoreAnimation 交给我们的 surface 是**预乘 alpha** 的（CG 的默认约定），
++ * 所以默认按预乘算：out = src + dst * (1 - a)。boot-arg sweetwp_premul=0 切到
++ * 直乘（out = src * a + dst * (1 - a)），只是留个对照，锁屏上两者只差半透明
++ * 边缘那一圈。
++ *
++ * 像素是 BGRA（小端读成 0xAARRGGBB）。面板本身不透明，输出 alpha 一律 0xff。
++ * a=0/255 两档在锁屏上占绝大多数（大片空白 + 文字），先走捷径；中间档用
++ * /256 的定点近似，误差不超过 1，省掉除法。
++ */
++static inline uint32_t
++sweet_fb_over(uint32_t src, uint32_t dst, bool premul)
++{
++	uint32_t a = src >> 24;
++	uint32_t ia, b, g, r;
++
++	if (a == 0) {
++		return dst | 0xff000000;
++	}
++	if (a == 255) {
++		return src | 0xff000000;
++	}
++	ia = 255 - a;
++	if (premul) {
++		b = ((src & 0xff) * 256 + (dst & 0xff) * ia + 128) >> 8;
++		g = (((src >> 8) & 0xff) * 256 + ((dst >> 8) & 0xff) * ia + 128) >> 8;
++		r = (((src >> 16) & 0xff) * 256 + ((dst >> 16) & 0xff) * ia + 128) >> 8;
++	} else {
++		uint32_t sa = a + 1;
++
++		b = ((src & 0xff) * sa + (dst & 0xff) * ia + 128) >> 8;
++		g = (((src >> 8) & 0xff) * sa + ((dst >> 8) & 0xff) * ia + 128) >> 8;
++		r = (((src >> 16) & 0xff) * sa + ((dst >> 16) & 0xff) * ia + 128) >> 8;
++	}
++	return 0xff000000 | (r << 16) | (g << 8) | b;
++}
++
++/* 预乘还是直乘，start() 里按 boot-arg 定一次；默认预乘（CG/IOSurface 的约定）。 */
++static bool sweet_fb_premul = true;
++
++/*
++ * 这一层是不是全不透明？按 SWEET_WP_ALPHA_STEP 像素一行扫过去，碰到任何一个
++ * a != 255 就认定半透明——宁可多走一遍混合，也不要把壁纸盖死。460 万像素按
++ * 步长 32 只剩 14 万次读，几百微秒。
++ */
++static bool
++sweet_fb_layer_opaque(const uint8_t *pixels, uint32_t rowBytes, int32_t x, int32_t y,
++    int32_t w, int32_t h)
++{
++	if (pixels == NULL || w <= 0 || h <= 0) {
++		return true;
++	}
++	for (int32_t ry = 0; ry < h; ry++) {
++		const uint8_t *row = pixels + (uint64_t)(y + ry) * rowBytes + (uint64_t)x * 4;
++		/*
++		 * 每行的起点按行号错开：步长固定 32 又总是从 0 开始的话，碰上"每 4
++		 * 个像素一个不透明像素"这种规整图案，采到的全是同一档次，会把半透明
++		 * 层误判成不透明，壁纸就被盖死了。
++		 */
++		int32_t start = ry & (SWEET_WP_ALPHA_STEP - 1);
++
++		for (int32_t rx = start; rx < w; rx += SWEET_WP_ALPHA_STEP) {
++			if (row[(uint64_t)rx * 4 + 3] != 0xff) {
++				return false;
++			}
++		}
++	}
++	return true;
++}
++
++/* 用壁纸填一块面板矩形（最近邻放大）。dst 是面板，坐标是面板坐标。 */
++static void
++sweet_fb_wall_fill(const struct sweet_fb_wall *w, uint8_t *dst, uint32_t dstRowBytes,
++    uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
++{
++	if (w == NULL || w->pixels == NULL || x1 <= x0 || y1 <= y0) {
++		return;
++	}
++	for (uint32_t y = y0; y < y1; y++) {
++		uint32_t wy = (uint32_t)(((uint64_t)y * w->stepY) >> 32);
++		const uint8_t *wrow;
++		uint8_t *drow = dst + (uint64_t)y * dstRowBytes + (uint64_t)x0 * 4;
++
++		if (wy >= w->height) {
++			wy = w->height - 1;
++		}
++		wrow = w->pixels + (uint64_t)wy * w->rowBytes;
++		for (uint32_t x = x0; x < x1; x++) {
++			uint32_t wx = (uint32_t)(((uint64_t)x * w->stepX) >> 32);
++
++			if (wx >= w->width) {
++				wx = w->width - 1;
++			}
++			memcpy(drow, wrow + (uint64_t)wx * 4, 4);
++			drow[3] = 0xff;
++			drow += 4;
++		}
++	}
++}
++
++/* 拷一个以 0 结尾的路径。kernel 里没有 snprintf，这点事自己干，省个头文件。 */
++static void
++sweet_fb_copy_path(char *dst, const char *src, uint32_t max)
++{
++	uint32_t i = 0;
++
++	if (max == 0) {
++		return;
++	}
++	while (src[i] != '\0' && i + 1 < max) {
++		dst[i] = src[i];
++		i++;
++	}
++	dst[i] = '\0';
++}
++
++
++/*
++ * 从根卷读整个文件到新分配的 kernel 缓冲。必须在进程上下文里调用（拿得到
++ * 凭据和 vfs 上下文）：SwapEnd 是 backboardd 的 IOConnectCallStructMethod，
++ * 正好满足，也正好是根卷挂好之后。任何一步失败都返回 NULL，调用方就当没有
++ * 壁纸，照旧跑。
++ */
++static void *
++sweet_fb_read_file(const char *path, uint32_t maxSize, uint32_t *outSize)
++{
++	vfs_context_t ctx;
++	struct vnode_attr va;
++	vnode_t vp = NULL;
++	uint8_t *buf;
++	uint32_t size, done = 0;
++	int resid;
++
++	ctx = vfs_context_current();
++	if (ctx == NULL) {
++		ctx = vfs_context_kernel();
++	}
++	if (ctx == NULL || vnode_lookup(path, 0, &vp, ctx) != 0 || vp == NULL) {
++		/*
++		 * 进程的根目录或凭据不对时（daemon 在 jail 里跑的场合）用内核上下文
++		 * 再试一次：这是一次性读取，读不到就当没有壁纸。
++		 */
++		vp = NULL;
++		ctx = vfs_context_kernel();
++		if (ctx == NULL || vnode_lookup(path, 0, &vp, ctx) != 0 || vp == NULL) {
++			return NULL;
++		}
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if (vnode_getattr(vp, &va, ctx) != 0 || !VATTR_IS_ACTIVE(&va, va_data_size)) {
++		vnode_put(vp);
++		return NULL;
++	}
++	size = (uint32_t)va.va_data_size;
++	if (size == 0 || size > maxSize || (size & 3) != 0) {
++		vnode_put(vp);
++		return NULL;
++	}
++	buf = (uint8_t *)IOMallocData(size);
++	if (buf == NULL) {
++		vnode_put(vp);
++		return NULL;
++	}
++	/* 分块读：一次 4 MB 的 uio 没必要，HFS 的簇读也更好受。 */
++	while (done < size) {
++		uint32_t chunk = size - done;
++
++		if (chunk > 1024 * 1024) {
++			chunk = 1024 * 1024;
++		}
++		resid = 0;
++		/* 不传 IO_NODELOCKED：vnode_lookup 返回的 vnode 没有锁在手上。 */
++		if (vn_rdwr(UIO_READ, vp, (caddr_t)(buf + done), (int)chunk, (off_t)done,
++		    UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid, NULL) != 0 ||
++		    resid != 0) {
++			IOFreeData(buf, size);
++			buf = NULL;
++			break;
++		}
++		done += chunk;
++	}
++	vnode_put(vp);
++	if (buf != NULL) {
++		*outSize = size;
++	}
++	return buf;
++}
++
++/*
++ * 混合时可选的一层"底"。传 NULL 就是原来的整块拷贝（全不透明的层走这条快路）；
++ * 非 NULL 就是逐像素 dst = over(源, 底)，底由 wall 决定：
++ *   wall != NULL  底是壁纸——源就是面板自己的时候用（读一行、混一行、写一行）；
++ *   wall == NULL  底是面板当前内容——面板里已经铺过壁纸。
++ */
++struct sweet_fb_base {
++	const struct sweet_fb_wall *wall;
++	bool premul;                    /* 源像素是不是预乘 alpha */
++};
++
++/*
++ * 混合模式下写一个目的像素：底 = 壁纸（wall 非 0）或面板当前内容。
++ *   rowx  这一行里目的像素的下标（drow 已经指向行首）
++ *   px,py 目的像素的面板绝对坐标（查壁纸用）
++ */
++static inline void
++sweet_fb_store(uint32_t *drow, uint32_t rowx, uint32_t px, uint32_t py,
++    uint32_t src, const struct sweet_fb_base *over)
++{
++	uint32_t base, out;
++
++	if (over->wall != NULL) {
++		memcpy(&base, sweet_fb_wall_at(over->wall, px, py), 4);
++	} else {
++		base = drow[rowx];
++	}
++	out = sweet_fb_over(src, base, over->premul);
++	memcpy(&drow[rowx], &out, 4);
++}
++
+ /*
+  * 把一个矩形按几何缩放贴进面板（最近邻，CPU 拷贝）。
+  *
+@@ -214,6 +496,7 @@ sweet_fb_geom_map(const struct sweet_fb_geom *g, int32_t lx, int32_t ly,
+  *   inplace      源就是面板缓冲自己的左上角（CA 直接画在默认 surface 上）：
+  *                目的永远在源的右下方向，所以从右下往左上写，绝不踩到还没
+  *                读的源像素。
++ *   over         NULL = 整块拷贝；否则逐像素 src-over（见 sweet_fb_base）。
+  *
+  * 返回写进面板的像素数。
+  */
+@@ -221,7 +504,8 @@ static uint32_t
+ sweet_fb_scale_blit(const struct sweet_fb_geom *g, uint8_t *dst, uint32_t dstRowBytes,
+     const uint8_t *src, uint32_t srcRowBytes,
+     int32_t lx, int32_t ly, int32_t lw, int32_t lh,
+-    int32_t sx, int32_t sy, int32_t sw, int32_t sh, bool inplace)
++    int32_t sx, int32_t sy, int32_t sw, int32_t sh, bool inplace,
++    const struct sweet_fb_base *over)
+ {
+ 	uint32_t X0, X1, Y0, Y1, cols, rows;
+ 	uint64_t colStep, rowStep;
+@@ -332,7 +616,11 @@ sweet_fb_scale_blit(const struct sweet_fb_geom *g, uint8_t *dst, uint32_t dstRow
+ 				if (c > maxCol) {
+ 					c = maxCol;
+ 				}
+-				drow[X0 + i] = srow[c];
++				if (over != NULL) {
++					sweet_fb_store(drow, X0 + i, X0 + i, Y0 + r, srow[c], over);
++				} else {
++					drow[X0 + i] = srow[c];
++				}
+ 				x += colStep;
+ 			}
+ 			fy += rowStep;
+@@ -358,7 +646,12 @@ sweet_fb_scale_blit(const struct sweet_fb_geom *g, uint8_t *dst, uint32_t dstRow
+ 				if (c > maxCol) {
+ 					c = maxCol;
+ 				}
+-				drow[X0 + i - 1] = srow[c];
++				if (over != NULL) {
++					sweet_fb_store(drow, X0 + i - 1, X0 + i - 1, Y0 + r - 1,
++					    srow[c], over);
++				} else {
++					drow[X0 + i - 1] = srow[c];
++				}
+ 				x -= colStep;
+ 			}
+ 			row -= rowStep;
+@@ -367,33 +660,48 @@ sweet_fb_scale_blit(const struct sweet_fb_geom *g, uint8_t *dst, uint32_t dstRow
+ 	return cols * rows;
+ }
+ 
++/* 刷一块面板矩形：有壁纸就用壁纸填，没有就刷黑。 */
++static void
++sweet_fb_fill_rect(uint8_t *pixels, uint32_t rowBytes, uint32_t x0, uint32_t y0,
++    uint32_t x1, uint32_t y1, const struct sweet_fb_wall *wall)
++{
++	if (x1 <= x0 || y1 <= y0) {
++		return;
++	}
++	if (wall != NULL) {
++		sweet_fb_wall_fill(wall, pixels, rowBytes, x0, y0, x1, y1);
++		return;
++	}
++	for (uint32_t y = y0; y < y1; y++) {
++		bzero(pixels + (uint64_t)y * rowBytes + (uint64_t)x0 * 4, (size_t)(x1 - x0) * 4);
++	}
++}
++
+ /*
+  * 缩放留下的黑边：把 dst 矩形以外的地方刷黑，否则开机画面 / 上一帧的残影
+  * 就留在那儿（1440x3118 上下各 41 行）。必须在贴完图之后再调用：原地放大
+  * 那条路径的源就压在顶栏下面那几行里。
++ *
++ * Plan Z：有壁纸时这里也铺壁纸——"先铺满整屏"的"整屏"就包括这两条边，
++ * 否则 AMOLED 上会看到两道黑杠。
+  */
+ static void
+-sweet_fb_clear_bars(const struct sweet_fb_geom *g, uint8_t *pixels, uint32_t rowBytes)
++sweet_fb_clear_bars(const struct sweet_fb_geom *g, uint8_t *pixels, uint32_t rowBytes,
++    const struct sweet_fb_wall *wall)
+ {
+-	uint32_t right;
++	uint32_t right = g->dstX + g->dstW;
++	uint32_t bottom = g->dstY + g->dstH;
+ 
+ 	if (g->dstX == 0 && g->dstY == 0 && g->dstW == g->panelW && g->dstH == g->panelH) {
+ 		return;         /* 铺满整块，没有黑边 */
+ 	}
+-	right = g->dstX + g->dstW;
+-	for (uint32_t y = 0; y < g->panelH; y++) {
+-		uint8_t *row = pixels + (uint64_t)y * rowBytes;
+-
+-		if (y < g->dstY || y >= g->dstY + g->dstH) {
+-			bzero(row, (size_t)g->panelW * 4);
+-			continue;
+-		}
+-		if (g->dstX > 0) {
+-			bzero(row, (size_t)g->dstX * 4);
+-		}
+-		if (right < g->panelW) {
+-			bzero(row + (uint64_t)right * 4, (size_t)(g->panelW - right) * 4);
+-		}
++	sweet_fb_fill_rect(pixels, rowBytes, 0, 0, g->panelW, g->dstY, wall);
++	sweet_fb_fill_rect(pixels, rowBytes, 0, bottom, g->panelW, g->panelH, wall);
++	if (g->dstX > 0) {
++		sweet_fb_fill_rect(pixels, rowBytes, 0, g->dstY, g->dstX, bottom, wall);
++	}
++	if (right < g->panelW) {
++		sweet_fb_fill_rect(pixels, rowBytes, right, g->dstY, g->panelW, bottom, wall);
+ 	}
+ }
+ 
+@@ -609,7 +917,21 @@ public:
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
++	/* Plan Z 壁纸（见文件前面 wall 那一节）：从根卷读的一张 BGRA。 */
++	uint8_t      *fWall;            /* 像素（IOMallocData），NULL = 没有壁纸 */
++	uint32_t      fWallBytes;
++	uint32_t      fWallW, fWallH;   /* 壁纸尺寸，默认 720x1600 */
++	uint32_t      fWallState;       /* 0 没试过，1 已载入，2 放弃（不再重试） */
++	struct sweet_fb_wall *fWallGeom; /* 映射对象；初始化完才发布，present 只读一次 */
++	uint32_t      fWallBlends;      /* 混合过的层数 */
++	uint32_t      fWallSeeds;       /* 整屏铺壁纸的次数 */
++	uint32_t      fWallLogged;      /* 已打过的层混合日志条数 */
++	uint32_t      fWallComposite;   /* 已打过的合成日志条数 */
++	char          fWallPath[SWEET_WP_PATH_MAX];
++
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free() APPLE_KEXT_OVERRIDE;
++	void loadWallpaper();
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -702,6 +1024,13 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	setProperty("canvas-width", fLogicalW, 32);
+ 	setProperty("canvas-height", fLogicalH, 32);
++	/* Plan Z 的混合方式：CG 交来的 surface 是预乘 alpha，默认按预乘算。 */
++	{
++		int premul = 1;
++
++		(void)PE_parse_boot_argn("sweetwp_premul", &premul, sizeof(premul));
++		sweet_fb_premul = premul != 0;
++	}
+ 	/*
+ 	 * IOMobileFramebuffer.framework（iOS 16.7）不是用 GetDisplaySize 问尺寸，
+ 	 * 而是从 service 的 provider（设备树里的 disp0 节点）读 canvas-width /
+@@ -863,6 +1192,82 @@ static uint32_t sweet_fb_scale_calls;   /* 缩放 blit 次数 */
+ static uint32_t sweet_fb_scale_pixels;  /* 缩放写进面板的像素数 */
+ static uint32_t sweet_fb_present_logged;
+ 
++void
++AppleCLCD::free(void)
++{
++	if (fWallGeom != NULL) {
++		IOFreeData(fWallGeom, sizeof(struct sweet_fb_wall));
++		fWallGeom = NULL;
++	}
++	if (fWall != NULL) {
++		IOFreeData(fWall, fWallBytes);
++		fWall = NULL;
++	}
++	IOService::free();
++}
++
++/*
++ * 载入壁纸：只在第一次 SwapEnd 里试一次（调用者已经把 fWallState 从 0 改成
++ * 2 占位）。失败永久放弃，不每帧重试——一条 IOLog 就够了，绝不能因为一张图
++ * 影响上屏。
++ */
++void
++AppleCLCD::loadWallpaper(void)
++{
++	uint32_t w = SWEET_WP_DEFAULT_W;
++	uint32_t h = SWEET_WP_DEFAULT_H;
++	uint32_t bytes = 0;
++	char custom[SWEET_WP_PATH_MAX];
++	uint8_t *buf;
++
++	sweet_fb_copy_path(fWallPath, SWEET_WP_DEFAULT_PATH, sizeof(fWallPath));
++	if (PE_parse_boot_arg_str("sweetwp", custom, sizeof(custom)) && custom[0] == '/') {
++		sweet_fb_copy_path(fWallPath, custom, sizeof(fWallPath));
++	}
++	(void)PE_parse_boot_argn("sweetwp_w", &w, sizeof(w));
++	(void)PE_parse_boot_argn("sweetwp_h", &h, sizeof(h));
++	buf = (uint8_t *)sweet_fb_read_file(fWallPath, SWEET_WP_MAX_BYTES, &bytes);
++	if (buf == NULL) {
++		IOLog("SWEET WP: no %s, running without wallpaper\n", fWallPath);
++		return;
++	}
++	if (w == 0 || h == 0 || (uint64_t)bytes < (uint64_t)w * h * 4) {
++		IOLog("SWEET WP: %s is %u bytes, need %ux%u BGRA, ignored\n",
++		    fWallPath, bytes, w, h);
++		IOFreeData(buf, bytes);
++		return;
++	}
++	if (bytes == 1440u * 3200u * 4 && (w != 1440 || h != 3200)) {
++		IOLog("SWEET WP: %s looks like 1440x3200, add sweetwp_w=1440 sweetwp_h=3200\n",
++		    fWallPath);
++	}
++	fWall = buf;
++	fWallBytes = bytes;
++	fWallW = w;
++	fWallH = h;
++	{
++		/*
++		 * 先写满结构，再一次性发布指针：present() 只读一次 fWallGeom，
++		 * arm64 上顺着这个指针取字段的访问都排在它后面（地址依赖），看不到
++		 * 半个结构。发布前的屏障是免得指针比字段先被看见。
++		 */
++		struct sweet_fb_wall *geom =
++		    (struct sweet_fb_wall *)IOMallocData(sizeof(struct sweet_fb_wall));
++
++		if (geom == NULL) {
++			IOFreeData(buf, bytes);
++			fWall = NULL;
++			return;
++		}
++		sweet_fb_wall_init(geom, fWall, w, h, fWidth, fHeight);
++		__atomic_thread_fence(__ATOMIC_SEQ_CST);
++		fWallGeom = geom;
++	}
++	fWallState = 1;
++	IOLog("SWEET WP: loaded %ux%u BGRA from %s (%u bytes), panel %ux%u\n",
++	    w, h, fWallPath, bytes, fWidth, fHeight);
++}
++
+ /*
+  * Copy each enabled layer's surface into the panel memory, scaling the
+  * logical 1125x2436 canvas up to the 1440x3200 panel (sweet_fb_scale_blit).
+@@ -876,6 +1281,15 @@ static uint32_t sweet_fb_present_logged;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	/*
++	 * Plan Z：壁纸只读一次，就趁第一次 SwapEnd。这里是 backboardd 的进程
++	 * 上下文（vnode 查找要凭据），根卷此时也挂好了；读失败就把状态钉在 2，
++	 * 之后每帧都走原来的路径，不再碰 VFS。
++	 */
++	if (fWallState == 0) {
++		fWallState = 2;         /* 先占位：读成功才改回 1 */
++		loadWallpaper();
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+@@ -902,6 +1316,33 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++	/*
++	 * Plan Z：面板里不能留上一帧的 UI。这一帧若没有"默认 surface"层
++	 * （SpringBoard 主窗口，CA 直接画在面板上），就先把壁纸整屏铺一遍，
++	 * 后面所有层都叠在壁纸上。有那一层时反而不能先铺——它的源像素就躺在
++	 * 面板里，先铺等于把源擦掉；那一层的混合在读同一行的同时就地完成，
++	 * 结果和"先铺壁纸再叠加"逐像素一致。
++	 */
++	bool direct_in_frame = false;
++	const struct sweet_fb_wall *wall = fWallGeom;   /* 只读一次 */
++
++	if (wall != NULL && fSurface != NULL && fPixels != 0) {
++		for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++			if ((mask & (1u << l)) && get32(rec, 0x54 + 4 * l) == fSurface->id) {
++				direct_in_frame = true;
++				break;
++			}
++		}
++		if (!direct_in_frame) {
++			sweet_fb_wall_fill(wall, (uint8_t *)fPixels, fRowBytes, 0, 0,
++			    fWidth, fHeight);
++			if (fWallSeeds++ < 4) {
++				IOLog("SWEET WP: seeded panel %ux%u from wallpaper (no default-surface layer)\n",
++				    fWidth, fHeight);
++			}
++		}
++	}
++
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -999,10 +1440,57 @@ AppleCLCD::present(const uint8_t *rec)
+ 		 */
+ 		bool identity = (fGeom.stepX == 0x10000 && fGeom.stepY == 0x10000 &&
+ 		    fGeom.dstX == 0 && fGeom.dstY == 0);
++		/*
++		 * Plan Z：壁纸已就位、这层又不是全不透明，就走逐像素 src-over。
++		 * 全不透明的层（主界面、开机画面这类）继续整块拷贝，快路留着。
++		 *
++		 * direct 层（默认 surface）的底只能是壁纸本身，其余层的底就是面板
++		 * 当前内容——那里面已经是壁纸（上面刚铺过，或上一帧混合的结果）。
++		 */
++		struct sweet_fb_base over;
++		bool blend = false;
++
++		over.wall = NULL;
++		over.premul = sweet_fb_premul;
++		if (wall != NULL && src != 0 && w > 0 && h > 0 &&
++		    !sweet_fb_layer_opaque((const uint8_t *)(src + s->offset), srcRowBytes,
++		    sx, sy, w, h)) {
++			blend = true;
++			if (direct) {
++				over.wall = wall;
++			}
++			if (fWallLogged < 8) {
++				fWallLogged++;
++				IOLog("SWEET WP: layer %u surface %u opaque=no, blend over %s\n",
++				    layer, s->id, direct ? "wallpaper" : "panel");
++			}
++		}
+ 
+ 		if (src != 0 && bpe == 4) {
+ 			if (identity) {
+-				if (!direct) {
++				if (blend) {
++					/*
++					 * 1:1 时源和目的下标完全相同，逐像素读-混合-写
++					 * 天然安全（direct 也走这条，原地混合）。
++					 */
++					for (int32_t y = 0; y < h; y++) {
++						uint32_t *drow = (uint32_t *)(fPixels +
++						    (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4);
++						const uint32_t *srow = (const uint32_t *)(src + s->offset +
++						    (uint64_t)(sy + y) * srcRowBytes + (uint64_t)sx * 4);
++
++						for (int32_t x = 0; x < w; x++) {
++							/*
++							 * drow 从右边 dx 开始，壁纸查表要用
++							 * 面板绝对坐标，两者别弄混。
++							 */
++							sweet_fb_store(drow, (uint32_t)x,
++							    (uint32_t)(dx + x), (uint32_t)(dy + y),
++							    srow[x], &over);
++						}
++					}
++					fWallBlends++;
++				} else if (!direct) {
+ 					for (int32_t y = 0; y < h; y++) {
+ 						memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes +
+ 						    (uint64_t)dx * 4),
+@@ -1016,8 +1504,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 				sweet_fb_scale_pixels += sweet_fb_scale_blit(&fGeom,
+ 				    (uint8_t *)fPixels, fRowBytes,
+ 				    (const uint8_t *)(src + s->offset), srcRowBytes,
+-				    dx, dy, w, h, sx, sy, w, h, direct);
++				    dx, dy, w, h, sx, sy, w, h, direct,
++				    blend ? &over : NULL);
+ 				sweet_fb_scale_calls++;
++				if (blend) {
++					fWallBlends++;
++				}
+ 			}
+ 		}
+ 		/*
+@@ -1137,9 +1629,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 		s->release();
+ 	}
+ 
+-	/* 黑边：必须在所有贴图之后（原地放大的源就在顶栏下面）。 */
++	/* 黑边：必须在所有贴图之后（原地放大的源就在顶栏下面）。有壁纸就铺壁纸。 */
+ 	if (fPixels != 0) {
+-		sweet_fb_clear_bars(&fGeom, (uint8_t *)fPixels, fRowBytes);
++		sweet_fb_clear_bars(&fGeom, (uint8_t *)fPixels, fRowBytes, wall);
+ 	}
+ 	/*
+ 	 * 第一次上屏把耗时和计量打出来：缩放是纯 CPU 的，1440x3118 一帧能花多少
+@@ -1150,9 +1642,23 @@ AppleCLCD::present(const uint8_t *rec)
+ 
+ 		sweet_fb_present_logged = 1;
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - begin, &ns);
+-		IOLog("SWEET FB: first present %llu us, scale %s, %u scaled layers/%u px, %u memcpy rows\n",
++		IOLog("SWEET FB: first present %llu us, scale %s, %u scaled layers/%u px, %u memcpy rows, wall %s\n",
+ 		    (unsigned long long)(ns / 1000), sweet_fb_scale_name(fGeom.mode),
+-		    sweet_fb_scale_calls, sweet_fb_scale_pixels, sweet_fb_memcpy_rows);
++		    sweet_fb_scale_calls, sweet_fb_scale_pixels, sweet_fb_memcpy_rows,
++		    wall != NULL ? "on" : "off");
++	}
++	/*
++	 * 上机第一眼就看这一行：面板正中间那个像素。壁纸生效就不再是黑的
++	 * （00000000 / ff000000），而是一张图的颜色。
++	 */
++	if (wall != NULL && fPixels != 0 && fWallComposite < 8) {
++		uint32_t center = 0;
++
++		fWallComposite++;
++		memcpy(&center, (const void *)(fPixels + (uint64_t)(fHeight / 2) * fRowBytes +
++		    (uint64_t)(fWidth / 2) * 4), 4);
++		IOLog("SWEET WP: composite %ux%u, %u layer(s) blended, %u seed(s), center 0x%08x\n",
++		    fWidth, fHeight, fWallBlends, fWallSeeds, center);
+ 	}
+ 	/*
+ 	 * SWEET: paint a test pattern over the top of the visible area. If it shows

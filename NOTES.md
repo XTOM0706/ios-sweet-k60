@@ -2,6 +2,14 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-31: 壁纸 Plan Z（0249，离线完成，未上机） <<<
+
+- **壁纸黑的根因**：壁纸由 PaperBoard 自己的 FBScene 画，是另一个 IOSurface；`AppleCLCD::present` 只合成 SwapEnd 记录里的那几层，所以锁屏底下什么都没有。Plan Z：内核先铺一张壁纸，再把 UI 按 alpha 做 src-over 叠上去。
+- **`xnu/patches/0249-k60-wallpaper-plan-z.patch`**（只改 `iokit/Kernel/arm/SweetFramebuffer.cpp`）。**没有动 0046**：它的 `swap` 已经被 0056 拆成 swap/present、被 0209 换成几何缩放+原地放大，改 0046 的 hunk 会让那两条 `git apply --check` 失败后被静默跳过（本项目栽过两次的那个坑）。新增 `sweet_fb_wall{,_init,_at,_fill}`、`sweet_fb_over`（定点 src-over，默认按 CG 的**预乘 alpha**，`sweetwp_premul=0` 切直乘，两种模式定点误差都 ≤1）、`sweet_fb_layer_opaque`（步长 32、每行起点按行号错开，避免"每 4 像素一个不透明"的规整图案被误判）、`sweet_fb_read_file`（`vnode_lookup`+`vn_rdwr`，在第一次 SwapEnd 的进程上下文里读）、`AppleCLCD::loadWallpaper/free`；`sweet_fb_scale_blit` 多一个 `const struct sweet_fb_base *over`（NULL=老快路；`over->wall` 非空=底是壁纸；`over->wall` 为 NULL=底是面板当前内容）；`clear_bars` 的黑边改成填壁纸。
+- **壁纸数据不进 patch**：内核从根卷读 `/private/var/SweetWallpaper.bgra`（裸 BGRA，默认 720x1600，`sweetwp` / `sweetwp_w` / `sweetwp_h` 可改），读不到只打一行 `SWEET WP: no ...`，行为与之前完全一致，不阻塞启动。理由：4.4 MB 裸图变 C 数组约 22 MB 文本，而 CI 缓存键是 `hashFiles('xnu/patches/**')`，换一张图就打穿整条构建缓存。`tools/mkiosroot.sh` 增加 `SWEET_WALLPAPER=path` 把它装进镜像；素材在本机 `/run/media/xtom0706/UNIWORK/k60-ios-2026-10-30/wall/wall720.bgra`（4608000 字节 = 720x1600x4，alpha 全 255），`wall.bgra.z` 是 1440x3200 的 zlib，解压后配 `sweetwp_w=1440 sweetwp_h=3200`。
+- **验证（全部离线，手机在跑别的实验，没碰设备）**：hunk 计数脚本 `bad: []`；把 201 个 patch 依序打到 xnu-8796.141.3 上再 `git apply` 0249，`--check` 通过且结果与工作树逐字节一致；像素算法抽成独立 C 程序测过（over 误差 ≤1、720→1440 最近邻、**就地放大混合与非就地参考逐像素相同**、bar 填充、opacity 采样）；本机 x86 一整屏 1440x3200 blend 8.0 ms、整屏铺壁纸 2.8 ms、透明度扫描 0.25 ms。
+- **上机看这几行**：`SWEET WP: loaded ...` / `SWEET WP: no ...` / `SWEET WP: ... is N bytes, need ...` / `SWEET WP: layer N surface S opaque=no, blend over wallpaper` / `SWEET WP: composite ... center 0x...`（中心像素不再是黑）/ `SWEET FB: first present ... wall on`。完整说明见 `docs/WALLPAPER-PLAN-Z.md`。
+
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
 
 **STATE at end of 2026-10-18 (evening):**

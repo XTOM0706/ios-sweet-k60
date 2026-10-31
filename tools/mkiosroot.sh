@@ -127,6 +127,29 @@ printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
 	'<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
 	sudo install -m 0600 -o 0 -g 0 /dev/stdin "$work/root/private/var/keybags/systembag.kb"
 
+# Plan Z wallpaper: the kernel (AppleCLCD) reads one raw BGRA file from this
+# volume on the first swap and paints it under the UI layers (see
+# docs/WALLPAPER-PLAN-Z.md). The image is not in git: point SWEET_WALLPAPER at
+# e.g. wall720.bgra (720x1600). Without it the kernel logs one line and runs
+# exactly as before (black lock screen).
+if [[ -n ${SWEET_WALLPAPER:-} ]]; then
+	if [[ ! -f $SWEET_WALLPAPER ]]; then
+		echo "SWEET_WALLPAPER not found: $SWEET_WALLPAPER" >&2
+		exit 1
+	fi
+	wp_size=$(stat -c %s "$SWEET_WALLPAPER")
+	if [[ $wp_size -le 0 ]] || (( wp_size % 4 != 0 )); then
+		echo "wallpaper must be raw BGRA (nonzero size, multiple of 4): $wp_size" >&2
+		exit 1
+	fi
+	sudo install -d -o 0 -g 0 -m 0755 "$work/root/private/var"
+	sudo install -o 0 -g 0 -m 0644 "$SWEET_WALLPAPER" \
+		"$work/root/private/var/SweetWallpaper.bgra"
+	echo "wallpaper: $SWEET_WALLPAPER ($wp_size bytes) -> /private/var/SweetWallpaper.bgra"
+else
+	echo "wallpaper: none (SWEET_WALLPAPER unset), kernel will run without one"
+fi
+
 df -h "$work/root"
 sudo umount "$work/root"
 # Linux hfsplus decomposes some non-ASCII names (localized Shortcuts examples)
