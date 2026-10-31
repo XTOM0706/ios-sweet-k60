@@ -9,8 +9,8 @@ jobs:
   mac13:
     runs-on: macos-13
     steps:
-      - run: sw_vers && xcodebuild -version
+      - run: sw_vers && xcodebuild -version && ls -d /Applications/Xcode*.app
   mac15:
     runs-on: macos-15
     steps:
-      - run: sw_vers && xcodebuild -version
+      - run: sw_vers && xcodebuild -version && ls -d /Applications/Xcode*.app
