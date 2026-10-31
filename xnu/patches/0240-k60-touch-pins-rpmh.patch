@@ -23,7 +23,9 @@ Goodix 协议）。这里按能力拆成 0240-0243 四个补丁，每个补丁�
                                     不 abort，是把互连卡死、等看门狗复位。
   RSC       0x17a20000              live FDT rsc@17a00000，reg 四段 drv-0..3，
                                     qcom,drv-id = 2 -> drv-2。pong 的 rsc-base
-                                    数值相同（0x17a20000），出处一致。
+                                    数值相同（0x17a20000），出处一致。实测
+                                    DRV_ID = 0x20700（主版本 2）；drv-0 一读
+                                    就 abort，drv-3 读了会挂，只映射这一页。
   command DB 0x80860000             live FDT aop_cmd_db_region@80860000，与 pong
                                     的 cmd_db_phys 相同。
   IOVDD     "ldoc2"                 live FDT rpmh-regulator-ldoc2 /
@@ -33,10 +35,24 @@ Goodix 协议）。这里按能力拆成 0240-0243 四个补丁，每个补丁�
   AVDD      GPIO71 高有效            live FDT goodix,avdd-gpio <&tlmm 0x47 0>。
                                     K60 上没有第二路 PMIC 轨（pong 有 ldoc3）。
 
-照抄 pong 的部分：TCS 的寄存器布局与 msgid（0x10008|0x100 响应位）、
-VRM_VOLTAGE/ENABLE/MODE = +0/+4/+8、LDO HPM 模式 = 7、cmdb 条目 8 字节 id 的
-memcmp 与 slave 表遍历、magic db 30 03 0c。这些是 RPMh 硬件的编码，不是板级
-参数。
+照抄 pong 的部分：msgid（0x10008|0x100 响应位）、VRM_VOLTAGE/ENABLE/MODE =
++0/+4/+8、LDO HPM 模式 = 7、cmdb 条目 8 字节 id 的 memcmp 与 slave 表遍历、
+magic db 30 03 0c。这些是 RPMh 硬件的编码，不是板级参数。
+
+2026-10-31 补：TCS 布局与电压这两处原来照抄错了，改用 UniXNU-sheng 的
+QcomRpmh 组件（纯算法、不碰硬件）里的做法：
+
+  - TCS 的寄存器偏移按 DRV_ID 的主版本选。本机实测 DRV_ID = 0x20700，
+    主版本 2，走 pong 那套老布局；主版本 >= 3 的 RSC 是另一套
+    （wait/control/status/cmd_enable 后移到 0x20/0x24/0x28/0x2c，命令步长
+    从 20 变 24）。DRV_ID 在 drv-2 块偏移 0，主版本在 bit 23:16。
+  - 写 VRM_VOLTAGE 的是 command DB 里该资源的 ARC 等级索引，不是 1800。
+    cmd-db 条目的 aux data 是一串 uint16 的等级（毫伏），取第一个不小于
+    请求值的索引（1800 mV 落在哪一档由固件决定）。
+
+另外把"读 RSC 之前先映射"写死：上一版在 ml_io_map 之前就读 TCS 的
+IRQ_ENABLE（k60_rsc 还是 0，等于读 0xd00 这个野地址），真机上就死在那
+一行。现在先映射、打印地址并刷盘，再读 DRV_ID。
 
 顺带让 0219-0223 退休：bsd/dev/k60_touch_spi.c 的 k60_touch_spi_init() 默认
 不再起线程（"K60 TOUCH: legacy five-stage probe retired"），只有显式
@@ -48,8 +64,10 @@ k60tlegacy=1 才跑；它自己的两个参数改名成 k60tlegacystage / k60tle
   init: stage 2 (1 pins, 2 +iovdd, ...)      参数解码，默认 2
   powered: avdd=1 reset=1 irq level 0        引脚配好、复位放过；0 是正常的
   cmd_db magic db 30 03 0c version N         command DB 认出来了
-  rpmh resource "ldoc2" -> 0x... (slave 4)   查到的 RPMh 地址与 slave
-  iovdd ldoc2 1800 mV mode 7 voted           RPMh 请求完成（这一步的成败行）
+  rpmh resource "ldoc2" -> 0x..., N aux levels (mV)  查到的地址与等级表
+  rsc drv id 0x20700 (major 2) -> ...        主版本选布局，本机走老布局
+  iovdd 1800 mV -> arc level index N of M    毫伏换成 ARC 等级索引
+  iovdd ldoc2 1800 mV (arc index N) mode 7 voted  RPMh 请求完成（成败行）
   irq after iovdd 1                          投票后 IRQ 被芯片拉高 = 芯片上电了
 
 失败时的行：pins failed / iovdd vote failed / iovdd failed / cmd_db has no
@@ -483,25 +501,40 @@ diff --git a/bsd/dev/k60_touch_rpmh.c b/bsd/dev/k60_touch_rpmh.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_touch_rpmh.c
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,431 @@
 +/*
 + * K60（mondrian，SM8475）触摸：IOVDD 的 RPMh 投票。
 + *
 + * 触摸芯片那一路 IOVDD 是 pm8350c 的 ldoc2（1.8 V），要应用处理器往 RPMh
 + * 投一票才会上电。这里只做一件事：在 command DB 里按名字找到 ldoc2 的
-+ * RPMh 地址，然后用 RSC 的 TCS 槽位发三条 4 字节写（电压、使能、模式）。
++ * RPMh 地址，把 1.8 V 换算成 command DB 给的 ARC 等级索引，然后用 RSC
++ * 的 TCS 槽位发三条 4 字节写（电压、使能、模式）。
 + *
-+ * 结构照 refs/UniXNU-pong 的 pong_goodix.c（那套代码在 pong 上跑通），
-+ * 地址换成本机的：
-+ *   RSC       0x17a20000  = live FDT rsc@17a00000 + drv-id 2 * 0x10000
++ * 地址：
++ *   RSC        0x17a20000 = live FDT rsc@17a00000 + drv-id 2 * 0x10000
 + *   command DB 0x80860000 = live FDT aop_cmd_db_region@80860000（同 pong）
 + *   regulator  "ldoc2"    = live FDT rpmh-regulator-ldoc2 / pm8350c_l2
-+ * pong 那边是 ldoc12 + ldoc3（两路），这里只有一路；AVDD 在 K60 上是 GPIO71。
++ *
++ * 实测（2026-10-31）：drv-2 可读，DRV_ID = 0x20700（主版本 2，老布局），
++ * TCS 0xd00 的 IRQ_ENABLE 已经是 1。drv-0 一读就 abort、drv-3 读了会挂，
++ * 所以只映射这一页 0x10000，一个字节都不越界。
++ *
++ * 与 pong 的 pong_goodix.c 有两处不同，都是照 UniXNU-sheng 的 QcomRpmh
++ * 组件改的：
++ *   1. TCS 的寄存器布局按 DRV_ID 的主版本选。pong 那代（主版本 < 3）的
++ *      wait/control/status/cmd_enable 在 0x10/0x14/0x18/0x1c，命令步长 20；
++ *      主版本 >= 3 改到 0x20/0x24/0x28/0x2c，命令步长 24。DRV_ID 在 DRV
++ *      块偏移 0，主版本在 bit 23:16。
++ *   2. 写进 VRM_VOLTAGE 的不是毫伏，而是 command DB 里该资源的 ARC 等级
++ *      索引。cmd-db 条目的 aux data 是一串 uint16 的等级（毫伏），取第一个
++ *      不小于请求值的索引。
 + *
 + * 判据行：
 + *   "K60 TOUCH: cmd_db magic ..."      command DB 认得出来
-+ *   "K60 TOUCH: rpmh resource \"ldoc2\" -> ..."  查到的地址与 slave
-+ *   "K60 TOUCH: iovdd ldoc2 1800 mV mode 7 voted ..."  投票完成
++ *   "K60 TOUCH: rsc drv id ..."        RSC 主版本与选中的布局
++ *   "K60 TOUCH: rpmh resource \"ldoc2\" -> ..."  查到的地址与等级表
++ *   "K60 TOUCH: iovdd 1800 mV -> arc level index ..."  电压换算成索引
++ *   "K60 TOUCH: iovdd ldoc2 1800 mV (arc index N) mode 7 voted ..."  投票完成
 + */
 +#include <pexpert/arm64/board_config.h>
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -517,23 +550,41 @@ new file mode 100644
 +/* live FDT：rsc@17a00000，qcom,drv-id = 2 -> 应用处理器的 TCS 在 drv-2。 */
 +#define K60_RSC_PHYS	(K60_TOUCH_RSC_BASE + K60_TOUCH_RSC_STRIDE * K60_TOUCH_RSC_DRV)
 +
-+/* TCS 槽位 0 的寄存器（pong 的布局，RSC 硬件编码；0xd00 是 DT 的 tcs-offset）。 */
-+#define K60_TCS(reg)			(k60_rsc + 0xd00u + (reg))
-+#define K60_TCS_IRQ_ENABLE		0x00u
-+#define K60_TCS_IRQ_STATUS		0x04u
-+#define K60_TCS_IRQ_CLEAR		0x08u
-+#define K60_TCS_WAIT_FOR_COMPLETION	0x10u
-+#define K60_TCS_CONTROL			0x14u
-+#define K60_TCS_CONTROL_ENABLE		(1u << 16)
-+#define K60_TCS_CONTROL_TRIGGER		(1u << 24)
-+#define K60_TCS_STATUS			0x18u	/* 0 表示槽位还忙 */
-+#define K60_TCS_CMD_ENABLE		0x1cu
-+#define K60_TCS_CMD_MSGID(n)		(0x30u + 20u * (n))
-+#define K60_TCS_CMD_ADDR(n)		(0x34u + 20u * (n))
-+#define K60_TCS_CMD_DATA(n)		(0x38u + 20u * (n))
++/* DRV_ID 在 DRV 块偏移 0，主版本在 bit 23:16。 */
++#define K60_RSC_DRV_ID		0u
++/* DT 的 tcs-offset：TCS 槽位 0 在这一页的 0xd00。 */
++#define K60_RSC_TCS_OFFSET	0xd00u
 +
-+#define K60_MSGID_WRITE_4_BYTES		0x10008u
-+#define K60_MSGID_RESPONSE		0x100u
++#define K60_TCS(reg)		(k60_rsc + K60_RSC_TCS_OFFSET + (reg))
++
++/* 两种布局里位置不变的寄存器。 */
++#define K60_TCS_IRQ_ENABLE	0x00u
++#define K60_TCS_IRQ_CLEAR	0x08u
++#define K60_TCS_CONTROL_ACTIVE_MODE	(1u << 16)
++#define K60_TCS_CONTROL_TRIGGER		(1u << 24)
++
++/* msgid：4 字节载荷、要求响应、写。 */
++#define K60_MSGID_WRITE_4_BYTES	0x10008u
++#define K60_MSGID_RESPONSE	0x100u
++
++#define K60_RPMH_MAX_LEVELS	16u
++
++/* TCS 的寄存器布局，偏移相对 TCS 槽位 0（DRV 基址 + tcs-offset）。 */
++struct k60_rsc_layout {
++	uint32_t tcs_stride, cmd_stride;
++	uint32_t irq_status, irq_clear, wait_for_cmpl, control, status;
++	uint32_t cmd_enable, cmd_msgid, cmd_addr, cmd_data;
++};
++
++/* RSC 主版本 >= 3：wait/control/status/cmd_enable 后移，命令步长 24。 */
++static const struct k60_rsc_layout k60_rsc_layout_v3 = {
++	672, 24, 0x04, 0x08, 0x20, 0x24, 0x28, 0x2c, 0x34, 0x38, 0x3c
++};
++
++/* pong 那代（主版本 < 3）：命令步长 20。 */
++static const struct k60_rsc_layout k60_rsc_layout_v2 = {
++	672, 20, 0x04, 0x08, 0x10, 0x14, 0x18, 0x1c, 0x30, 0x34, 0x38
++};
 +
 +static vm_offset_t k60_rsc, k60_cmd_db;
 +static int k60_iovdd_done;
@@ -550,12 +601,25 @@ new file mode 100644
 +	uint8_t data[];
 +};
 +
++/* 条目 24 字节；length/offset 指向 data 区里的 aux data（等级表）。 */
 +struct k60_cmd_db_entry {
 +	char id[8];
 +	uint32_t priority[2];
 +	uint32_t address;
 +	uint16_t length, offset;
 +};
++
++struct k60_rpmh_resource {
++	uint32_t address;
++	uint16_t levels[K60_RPMH_MAX_LEVELS];
++	unsigned level_count;
++};
++
++static int
++k60_fits(uint32_t offset, uint32_t length, uint32_t size)
++{
++	return offset <= size && length <= size - offset;
++}
 +
 +static int
 +k60_cmd_db_map(void)
@@ -583,18 +647,58 @@ new file mode 100644
 +}
 +
 +/*
-+ * 按名字查 RPMh 地址（0 = 没有）。pong 只查小写；这里再补一次全大写，
-+ * 因为 command DB 的条目大小写在不同固件上不一致，查到哪个都打出来。
++ * 把条目里的 aux data 读成等级表。aux data 是一串小端 uint16（毫伏），
++ * 表尾用零填充；长度对不上窗口就算坏条目。
 + */
-+static uint32_t
-+k60_rpmh_address(const char *name)
++static int
++k60_rpmh_levels(const struct k60_cmd_db_header *db, uint32_t data_offset,
++    const struct k60_cmd_db_entry *entry, struct k60_rpmh_resource *out)
++{
++	uint32_t at, length, l;
++	uint16_t level;
++
++	memset(out, 0, sizeof(*out));
++	out->address = entry->address;
++	if (out->address == 0) {
++		printf("K60 TOUCH: cmd_db entry \"%.8s\" has no address\n",
++		    entry->id);
++		return -1;
++	}
++	length = entry->length;
++	at = data_offset + entry->offset;
++	if (!k60_fits(at, length, K60_TOUCH_CMD_DB_WINDOW)) {
++		printf("K60 TOUCH: cmd_db aux data %#x+%u is outside the window\n",
++		    at, length);
++		return -1;
++	}
++	for (l = 0; l + 1 < length && out->level_count < K60_RPMH_MAX_LEVELS;
++	    l += 2) {
++		level = (uint16_t)(db->data[at + l] |
++		    ((uint16_t)db->data[at + l + 1] << 8));
++		if (out->level_count != 0 && level == 0) {
++			break;	/* 等级表是零填充的 */
++		}
++		out->levels[out->level_count++] = level;
++	}
++	return 0;
++}
++
++/*
++ * 按名字查 RPMh 地址与等级表（0 = 成功）。pong 只查小写；这里再补一次
++ * 全大写，因为 command DB 的条目大小写在不同固件上不一致，查到哪个都
++ * 打出来。
++ */
++static int
++k60_rpmh_find(const char *name, struct k60_rpmh_resource *out)
 +{
 +	const struct k60_cmd_db_header *db;
++	const struct k60_cmd_db_entry *entry;
 +	char id[8], upper[8];
 +	unsigned s, i;
++	uint32_t header_offset, data_offset, count, table_bytes;
 +
 +	if (k60_cmd_db_map() != 0) {
-+		return 0;
++		return -1;
 +	}
 +	memset(id, 0, sizeof(id));
 +	memset(upper, 0, sizeof(upper));
@@ -606,102 +710,172 @@ new file mode 100644
 +	db = (const struct k60_cmd_db_header *)k60_cmd_db;
 +	for (s = 0; s < 8; s++) {
 +		const struct k60_cmd_db_slave *slave = &db->slave[s];
-+		const struct k60_cmd_db_entry *entry;
-+		uint32_t header_offset = slave->header_offset;
-+		uint32_t table_bytes = (uint32_t)slave->count *
-+		    sizeof(*entry);
 +
++		header_offset = slave->header_offset;
++		data_offset = slave->data_offset;
++		count = slave->count;
++		table_bytes = count * (uint32_t)sizeof(*entry);
 +		/* 表头本身（144 = 4 + 4 + 8 个 slave + 8）与整张表都必须在窗口内。 */
-+		if (slave->id == 0 || slave->count > 512 ||
-+		    header_offset > K60_TOUCH_CMD_DB_WINDOW - 144u ||
-+		    table_bytes > K60_TOUCH_CMD_DB_WINDOW - 144u - header_offset) {
++		if (slave->id == 0 || count > 512 ||
++		    !k60_fits(header_offset, table_bytes,
++		    K60_TOUCH_CMD_DB_WINDOW) ||
++		    data_offset > K60_TOUCH_CMD_DB_WINDOW) {
 +			continue;
 +		}
-+		entry = (const struct k60_cmd_db_entry *)(db->data + header_offset);
-+		for (i = 0; i < slave->count; i++) {
-+			if (memcmp(entry[i].id, id, sizeof(id)) == 0 ||
-+			    memcmp(entry[i].id, upper, sizeof(id)) == 0) {
-+				printf("K60 TOUCH: rpmh resource \"%s\" -> %#x "
-+				    "(slave %u, priority %u)\n", name,
-+				    entry[i].address,
-+				    (entry[i].address >> 16) & 0xfu,
-+				    entry[i].priority[0]);
-+				return entry[i].address;
++		entry = (const struct k60_cmd_db_entry *)(db->data +
++		    header_offset);
++		for (i = 0; i < count; i++) {
++			if (memcmp(entry[i].id, id, sizeof(id)) != 0 &&
++			    memcmp(entry[i].id, upper, sizeof(id)) != 0) {
++				continue;
 +			}
++			if (k60_rpmh_levels(db, data_offset, &entry[i],
++			    out) != 0) {
++				return -1;
++			}
++			printf("K60 TOUCH: rpmh resource \"%s\" -> %#x, "
++			    "%u aux levels (mV): %u %u %u %u\n", name,
++			    out->address, out->level_count,
++			    out->level_count > 0 ? out->levels[0] : 0,
++			    out->level_count > 1 ? out->levels[1] : 0,
++			    out->level_count > 2 ? out->levels[2] : 0,
++			    out->level_count > 3 ? out->levels[3] : 0);
++			return 0;
 +		}
 +	}
 +	printf("K60 TOUCH: rpmh resource \"%s\" is not in the command db\n",
 +	    name);
-+	return 0;
-+}
-+
-+static int
-+k60_rpmh_wait(uint32_t reg, uint32_t mask, uint32_t value, const char *what)
-+{
-+	int i;
-+
-+	for (i = 0; i < 2000; i++) {
-+		if ((K60_TOUCH_RD(K60_TCS(reg)) & mask) == value) {
-+			return 0;
-+		}
-+		delay(100);
-+	}
-+	printf("K60 TOUCH: rpmh: timeout waiting for %s (reg %#x = %#x)\n",
-+	    what, reg, K60_TOUCH_RD(K60_TCS(reg)));
 +	return -1;
 +}
 +
-+/* 一次发 count (<= 3) 条 4 字节写，等槽位报完成。 */
++/*
++ * 等级 -> ARC 索引：取第一个不小于请求值的等级；请求值高过整张表时取
++ * 最后一个（最高档）；0 表示关掉这一票，索引 0。
++ */
 +static int
-+k60_rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
++k60_rpmh_level_index(const struct k60_rpmh_resource *r, uint32_t mv,
++    uint32_t *index)
 +{
-+	uint32_t irq_enable = K60_TOUCH_RD(K60_TCS(K60_TCS_IRQ_ENABLE));
 +	unsigned i;
-+	int error;
++
++	if (r->level_count == 0) {
++		return -1;
++	}
++	if (mv == 0) {
++		*index = 0;
++		return 0;
++	}
++	for (i = 0; i < r->level_count; i++) {
++		if (r->levels[i] >= mv) {
++			*index = i;
++			return 0;
++		}
++	}
++	*index = r->level_count - 1;
++	return 0;
++}
++
++/* 映射 drv-2 并读 DRV_ID；主版本 >= 3 用新布局，读之前先落一行盘。 */
++static const struct k60_rsc_layout *
++k60_rsc_map(void)
++{
++	const struct k60_rsc_layout *layout;
++	uint32_t drv_id;
++	unsigned major;
 +
 +	if (k60_rsc == 0) {
 +		k60_rsc = ml_io_map(K60_RSC_PHYS, K60_TOUCH_RSC_WINDOW);
 +		if (k60_rsc == 0) {
 +			printf("K60 TOUCH: rpmh: rsc map failed at %#lx\n",
 +			    (unsigned long)K60_RSC_PHYS);
-+			return -1;
++			return 0;
 +		}
 +	}
-+	for (i = 0; K60_TOUCH_RD(K60_TCS(K60_TCS_STATUS)) == 0; i++) {
-+		if (i > 2000) {
-+			printf("K60 TOUCH: rpmh: the command slots stay busy\n");
-+			return -1;
++	k60_touch_flush();
++	printf("K60 TOUCH: rsc drv-2 mapped at %#lx, reading drv id at %#lx\n",
++	    (unsigned long)k60_rsc, (unsigned long)(k60_rsc + K60_RSC_DRV_ID));
++	k60_touch_flush();
++	drv_id = K60_TOUCH_RD(k60_rsc + K60_RSC_DRV_ID);
++	major = (drv_id >> 16) & 0xffu;
++	layout = major >= 3 ? &k60_rsc_layout_v3 : &k60_rsc_layout_v2;
++	printf("K60 TOUCH: rsc drv id %#x (major %u) -> tcs %#lx, layout %s: "
++	    "cmd stride %u, wait %#x control %#x status %#x cmd_enable %#x\n",
++	    drv_id, major, (unsigned long)(k60_rsc + K60_RSC_TCS_OFFSET),
++	    major >= 3 ? "v3" : "v2", layout->cmd_stride,
++	    layout->wait_for_cmpl, layout->control, layout->status,
++	    layout->cmd_enable);
++	k60_touch_flush();
++	return layout;
++}
++
++static int
++k60_rpmh_wait(uint32_t offset, uint32_t mask, uint32_t value,
++    const char *what)
++{
++	int i;
++
++	for (i = 0; i < 2000; i++) {
++		if ((K60_TOUCH_RD(K60_TCS(offset)) & mask) == value) {
++			return 0;
 +		}
 +		delay(100);
 +	}
-+	/* 关掉槽位：先 trigger 后 enable，硬件要求的顺序。 */
-+	K60_TOUCH_WR(K60_TCS(K60_TCS_CONTROL),
-+	    K60_TOUCH_RD(K60_TCS(K60_TCS_CONTROL)) & ~K60_TCS_CONTROL_TRIGGER);
-+	K60_TOUCH_WR(K60_TCS(K60_TCS_CONTROL),
-+	    K60_TOUCH_RD(K60_TCS(K60_TCS_CONTROL)) & ~K60_TCS_CONTROL_ENABLE);
-+	K60_TOUCH_WR(K60_TCS(K60_TCS_IRQ_CLEAR), 1);
-+	for (i = 0; i < count; i++) {
-+		K60_TOUCH_WR(K60_TCS(K60_TCS_CMD_MSGID(i)),
-+		    K60_MSGID_WRITE_4_BYTES | K60_MSGID_RESPONSE);
-+		K60_TOUCH_WR(K60_TCS(K60_TCS_CMD_ADDR(i)), address[i]);
-+		K60_TOUCH_WR(K60_TCS(K60_TCS_CMD_DATA(i)), data[i]);
-+	}
-+	K60_TOUCH_WR(K60_TCS(K60_TCS_WAIT_FOR_COMPLETION), (1u << count) - 1);
-+	K60_TOUCH_WR(K60_TCS(K60_TCS_CMD_ENABLE), (1u << count) - 1);
-+	/* 状态位跟着使能走；中断本身留给引导装载程序时的样子（屏蔽）。 */
-+	K60_TOUCH_WR(K60_TCS(K60_TCS_IRQ_ENABLE), irq_enable | 1u);
-+	K60_TOUCH_WR(K60_TCS(K60_TCS_CONTROL), K60_TCS_CONTROL_ENABLE);
-+	K60_TOUCH_WR(K60_TCS(K60_TCS_CONTROL),
-+	    K60_TCS_CONTROL_ENABLE | K60_TCS_CONTROL_TRIGGER);
++	printf("K60 TOUCH: rpmh: timeout waiting for %s (tcs+%#x = %#x)\n",
++	    what, offset, K60_TOUCH_RD(K60_TCS(offset)));
++	return -1;
++}
 +
-+	error = k60_rpmh_wait(K60_TCS_IRQ_STATUS, 1, 1, "the request");
-+	K60_TOUCH_WR(K60_TCS(K60_TCS_CONTROL),
-+	    K60_TOUCH_RD(K60_TCS(K60_TCS_CONTROL)) & ~K60_TCS_CONTROL_TRIGGER);
-+	K60_TOUCH_WR(K60_TCS(K60_TCS_CONTROL),
-+	    K60_TOUCH_RD(K60_TCS(K60_TCS_CONTROL)) & ~K60_TCS_CONTROL_ENABLE);
-+	K60_TOUCH_WR(K60_TCS(K60_TCS_CMD_ENABLE), 0);
-+	K60_TOUCH_WR(K60_TCS(K60_TCS_WAIT_FOR_COMPLETION), 0);
-+	K60_TOUCH_WR(K60_TCS(K60_TCS_IRQ_CLEAR), 1);
++/* 一次发 count (<= 4) 条 4 字节写，等槽位报完成，再把槽位收回空闲。 */
++static int
++k60_rpmh_active_request(const struct k60_rsc_layout *l, unsigned tcs,
++    const uint32_t *address, const uint32_t *value, unsigned count)
++{
++	uint32_t base = l->tcs_stride * tcs;
++	uint32_t mask;
++	uint32_t irq_enable;
++	unsigned i;
++	int error;
++
++	if (k60_rsc == 0 || count == 0 || count > 4) {
++		return -1;
++	}
++	mask = (1u << count) - 1;
++	irq_enable = K60_TOUCH_RD(K60_TCS(K60_TCS_IRQ_ENABLE));
++	/* 关键：写命令之前先把控制位与使能位清掉，让硬件认这个槽是空闲的。 */
++	K60_TOUCH_WR(K60_TCS(base + l->control), 0);
++	K60_TOUCH_WR(K60_TCS(base + l->cmd_enable), 0);
++	delay(100);
++	/* 只记录不拦：pong 那套和 QcomRpmh 都不看 status，清掉控制位就是空闲。 */
++	printf("K60 TOUCH: tcs control %#x status %#x cmd_enable %#x before "
++	    "the request\n",
++	    K60_TOUCH_RD(K60_TCS(base + l->control)),
++	    K60_TOUCH_RD(K60_TCS(l->status)),
++	    K60_TOUCH_RD(K60_TCS(base + l->cmd_enable)));
++	k60_touch_flush();
++	K60_TOUCH_WR(K60_TCS(l->irq_clear), 1u << tcs);
++	for (i = 0; i < count; i++) {
++		uint32_t cmd = base + l->cmd_stride * i;
++
++		K60_TOUCH_WR(K60_TCS(cmd + l->cmd_msgid),
++		    K60_MSGID_WRITE_4_BYTES | K60_MSGID_RESPONSE);
++		K60_TOUCH_WR(K60_TCS(cmd + l->cmd_addr), address[i]);
++		K60_TOUCH_WR(K60_TCS(cmd + l->cmd_data), value[i]);
++	}
++	K60_TOUCH_WR(K60_TCS(base + l->wait_for_cmpl), mask);
++	K60_TOUCH_WR(K60_TCS(base + l->cmd_enable), mask);
++	/* 槽位的中断位要开，完成状态才一定会写；结束再恢复。 */
++	K60_TOUCH_WR(K60_TCS(K60_TCS_IRQ_ENABLE), irq_enable | (1u << tcs));
++	K60_TOUCH_WR(K60_TCS(base + l->control), K60_TCS_CONTROL_ACTIVE_MODE);
++	K60_TOUCH_WR(K60_TCS(base + l->control),
++	    K60_TCS_CONTROL_ACTIVE_MODE | K60_TCS_CONTROL_TRIGGER);
++
++	error = k60_rpmh_wait(l->irq_status, 1u << tcs, 1u << tcs,
++	    "the request");
++	/* finish：清中断、清控制与使能，槽位回到空闲。 */
++	K60_TOUCH_WR(K60_TCS(l->irq_clear), 1u << tcs);
++	K60_TOUCH_WR(K60_TCS(base + l->control), 0);
++	K60_TOUCH_WR(K60_TCS(base + l->cmd_enable), 0);
++	K60_TOUCH_WR(K60_TCS(base + l->wait_for_cmpl), 0);
 +	K60_TOUCH_WR(K60_TCS(K60_TCS_IRQ_ENABLE), irq_enable);
 +	return error;
 +}
@@ -709,7 +883,9 @@ new file mode 100644
 +int
 +k60_touch_iovdd_on(void)
 +{
-+	uint32_t base, address[3], data[3];
++	const struct k60_rsc_layout *layout;
++	struct k60_rpmh_resource res;
++	uint32_t address[3], value[3], index = 0;
 +	uint32_t mv = K60_TOUCH_IOVDD_MV;
 +	uint32_t mode = K60_TOUCH_IOVDD_MODE;
 +	int error;
@@ -720,25 +896,38 @@ new file mode 100644
 +	printf("K60 TOUCH: stage 2: iovdd pm8350c \"%s\" -> %u mV mode %u\n",
 +	    K60_TOUCH_IOVDD_RESOURCE, mv, mode);
 +	k60_touch_flush();
-+	base = k60_rpmh_address(K60_TOUCH_IOVDD_RESOURCE);
-+	if (base == 0) {
++	layout = k60_rsc_map();
++	if (layout == 0) {
 +		return -1;
 +	}
-+	address[0] = base + K60_TOUCH_VRM_VOLTAGE;
-+	address[1] = base + K60_TOUCH_VRM_ENABLE;
-+	address[2] = base + K60_TOUCH_VRM_MODE;
-+	data[0] = mv;
-+	data[1] = 1;		/* 打开 */
-+	data[2] = mode;
-+	error = k60_rpmh_write(address, data, 3);
++	if (k60_rpmh_find(K60_TOUCH_IOVDD_RESOURCE, &res) != 0) {
++		return -1;
++	}
++	if (k60_rpmh_level_index(&res, mv, &index) != 0) {
++		printf("K60 TOUCH: rpmh resource \"%s\" has no aux levels, "
++		    "cannot map %u mV\n", K60_TOUCH_IOVDD_RESOURCE, mv);
++		k60_touch_flush();
++		return -1;
++	}
++	printf("K60 TOUCH: iovdd %u mV -> arc level index %u of %u "
++	    "(levels %u %u %u %u mV)\n", mv, index, res.level_count,
++	    res.levels[0], res.levels[1], res.levels[2], res.levels[3]);
++	k60_touch_flush();
++	address[0] = res.address + K60_TOUCH_VRM_VOLTAGE;
++	address[1] = res.address + K60_TOUCH_VRM_ENABLE;
++	address[2] = res.address + K60_TOUCH_VRM_MODE;
++	value[0] = index;
++	value[1] = 1;		/* 打开 */
++	value[2] = mode;
++	error = k60_rpmh_active_request(layout, 0, address, value, 3);
 +	if (error != 0) {
 +		printf("K60 TOUCH: iovdd vote failed, touch will not answer\n");
 +		k60_touch_flush();
 +		return -1;
 +	}
 +	k60_iovdd_done = 1;
-+	printf("K60 TOUCH: iovdd ldoc2 %u mV mode %u voted (rpmh done)\n", mv,
-+	    mode);
++	printf("K60 TOUCH: iovdd ldoc2 %u mV (arc index %u) mode %u voted "
++	    "(rpmh done)\n", mv, index, mode);
 +	k60_touch_flush();
 +	return 0;
 +}

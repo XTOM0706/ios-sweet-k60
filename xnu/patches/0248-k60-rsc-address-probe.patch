@@ -14,7 +14,7 @@ diff --git a/bsd/sys/k60_touch.h b/bsd/sys/k60_touch.h
 diff --git a/bsd/dev/k60_touch_rpmh.c b/bsd/dev/k60_touch_rpmh.c
 --- a/bsd/dev/k60_touch_rpmh.c
 +++ b/bsd/dev/k60_touch_rpmh.c
-@@ -283,3 +283,40 @@
+@@ -449,3 +449,40 @@
  }
  
  #endif /* ARM64_BOARD_CONFIG_SWEET */
@@ -28,15 +28,15 @@ diff --git a/bsd/dev/k60_touch_rpmh.c b/bsd/dev/k60_touch_rpmh.c
 +{
 +	/*
 +	 * 从 drv-2 那一段开始读（0x17a20000，也就是 pong 那边触摸驱动写死的
-+	 * rsc_phys）。偏移 0 是控制器本体的第一页，之前那一读直接 external abort，
-+	 * 所以不再碰，只探 TCS 所在的 0x20000 段。
++	 * rsc_phys）。0x17a00000（drv-0）一读就 external abort，0x17a30000
++	 * （drv-3）读了会挂，所以只探中间的 drv-2 这一页。
 +	 */
 +	static const uint32_t offsets[] = {
-+		0x20000, 0x20d00, 0x20d14, 0x20d1c, 0x20d20, 0x21000, 0x30000
++		0x20000, 0x20d00, 0x20d14, 0x20d1c, 0x20d20, 0x21000
 +	};
 +
 +	if (k60_rsc == 0) {
-+		k60_rsc = ml_io_map(K60_TOUCH_RSC_BASE, 0x40000);
++		k60_rsc = ml_io_map(K60_TOUCH_RSC_BASE, 0x22000);
 +		if (k60_rsc == 0) {
 +			printf("K60 TOUCH: rsc probe: map failed\n");
 +			return -1;
