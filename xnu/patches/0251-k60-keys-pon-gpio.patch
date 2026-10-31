@@ -1,0 +1,890 @@
+xnu: K60 按键：PON periph 0x13 的电源键/音量减 + pm8350 GPIO6 的音量加
+
+0062 的 sweet_keys.c 是照 sweet 板写的：PON 读 0x0810（SID 0 / periph
+0x08），音量加读 PM6150L 的 SID 4 / periph 0xc1。这两条在 mondrian
+（SM8475）上都不对，证据都在 ~/hackios/dump/live.dts 里：
+
+  qcom,pmk8350@0 { reg = <0x00 0x00>;                 // SID 0
+    pon_hlos@1300 { reg = <0x1300 0x800>;
+      reg-names = "pon_hlos", "pon_pbs";
+      pwrkey { interrupts = <0x00 0x13 0x07 0x03>; linux,code = <0x74>; }
+      resin  { interrupts = <0x00 0x13 0x06 0x03>; linux,code = <0x72>; }
+      pwrkey-bark { interrupts = <0x00 0x13 0x00 0x03>; } }; };
+
+SPMI 中断说明符是 <USID periph irq type>，所以 APPS 这一侧的 PON 是
+periph 0x13（pon_hlos@1300），而 0x0810 落在 pon_pbs@800 —— 那是 PBS 的
+页，APPS 读不到按键状态。0x74 = KEY_POWER，0x72 = KEY_VOLDOWN：这台机器
+的音量减挂在 PON 的 resin 上。
+
+  gpio_keys { vol_up { gpios = <0x57b 0x06 0x01>; linux,code = <0x73>; }; };
+  qcom,pm8350@1 { reg = <0x01 0x00>;                  // SID 1
+    pinctrl@8800 { compatible = "qcom,pm8350-gpio"; phandle = <0x57b>; }; };
+  key_vol_up_default { pins = "gpio6"; input-enable; bias-pull-up; };
+
+0x57b 是 pm8350 自己的 pinctrl@8800，不是 TLMM —— 音量加是 PMIC 引脚，
+TLMM(0x0f100000) 上没有它。reg 0x8800 就是 GPIO1 的页，每脚 0x100，所以
+GPIO6 = 0x8d00，页内 INT_RT_STS 在 0x10。第三项 0x01 = ACTIVE_LOW：按下
+就是 bit0 变 0。
+
+  bsd/sys/k60_keys.h      常量与出处（每条都写明是 DT 依据还是推断）
+  bsd/dev/k60_keys.c      轮询线程：PON + GPIO，边沿检测，上报 sweet_hid_key
+  bsd/conf/files          登记新文件
+  bsd/dev/sweet_keys.c    探到 K60 的 PON lane 就让位（sweetkeys=1 可强留）
+  bsd/dev/sweet_ufs.c     在 sweet_keys_init() 前面调 k60_keys_init()
+
+两条读路径为什么不一样：
+
+  PON（0x13，SID 0）走 sweet_spmi_read() —— SweetBattery 也在读 0x13，
+  同一个 PPID 的 obsrvr 通道只能有一条线程在里面，所以必须共用 sp_lock。
+  万一电池 personality 没起来，第一次失败后补一次 sweet_spmi_init() 再
+  重试，并把返回值打出来（"电源键不工作"不该被误当成寄存器问题）。
+  音量加的 GPIO（0x8d，SID 1）自己发 EXT_READL：sweet_spmi_read() 的门禁
+  只放行电池的 0x10-0x13/0x48，而这条 lane 没有第二个人用。
+
+全程只读：唯一的 MMIO 写是 obsrvr 通道上的 EXT_READL 命令字，一个 PMIC
+配置寄存器都不碰（不使能、不去抖、不 ack 中断、不清 latch）；MMIO 窗口
+也只有 sweet_spmi.c/sweet_keys.c 已经在用的 core/cnfg/obs 三段，没有新地址。
+上一轮野地址读挂过两次，这个补丁不新增任何映射。
+
+寄存器语义里哪些是实测依据、哪些是推断（推断的都留了 boot-arg）：
+
+  实测/DT   PON 在 SID 0 periph 0x13，kpdpwr = irq 7，resin = irq 6（DT）
+  实测/DT   音量加 = pm8350 GPIO6，页 0x8d00，低有效、上拉、输入（DT）
+  实测/DT   0x8800 是 GPIO1 的页、每脚 0x100（DT 的 reg 与 gpios 引脚号）
+  推断      PON 的 0x10 = INT_RT_STS，位号 = 中断号 → bit7 电源、bit6 音量减
+            （本机没有 PMK8350 手册；依据是同族 PON 的 0x10/位号约定，以及
+            0062 在没有手册的 sweet 板上就是这么读的且实测能报键）
+  推断      GPIO 页内 MODE_CTL 0x40 / DIG_PULL_CTL 0x42 / EN_CTL 0x46
+            （和 0062 在 sweet 板用过的 0xc140/0xc146/0xc105 同一套页内偏移）
+
+所以音量加在启用前会回读 EN_CTL/MODE_CTL/PERPH_SUBTYPE，确认这一页确实被
+固件配成"输入 + 打开"；对不上就整条键都不上报，只打印原因并把 0x88-0x93
+这十二个候选页的 RT/MODE/EN 打出来（下一轮 boot 就知道该看哪一页）。宁可
+少一条键，也不要把别的引脚的变化报成音量加。
+
+boot-arg：
+
+  k60keys=0        整个关掉（默认开）
+  k60keysdelay=N   起步延迟秒，默认 20（和 k60_touch 一致，等 GUI 起来）
+  k60keysperiod=N  轮询周期毫秒，默认 25
+  k60keysprobe=1   额外只读探测：仲裁器表里按键相关的 PPID、PON 的
+                   0x00-0x1f、0x88-0x93 十二个 GPIO 页
+  k60keyspwbit=N   电源键用 PON 的第几位，默认 7
+  k60keysresbit=N  音量减用 PON 的第几位，默认 6
+
+上机要看的行（K60 KEYS: 开头，每行之后落盘）：
+
+  K60 KEYS: init: arb=... pon(ppid 0x0013) apid=... owner=... ...
+  K60 KEYS: gpio6 page 0x8d00 subtype=... mode=... dir=... en=... pull=...
+  K60 KEYS: pon rt idle 0x.., power = bit7 (0), volume down = bit6 (0)
+  K60 KEYS: gpio6 rt idle 0x01 (bit0 1 = released, active low)
+  K60 KEYS: polling (volume up armed, pon armed)
+  K60 KEYS: pon rt 0x00 -> 0x80 (flip 0x80)
+  K60 KEYS: pon bit7 is now 1
+  K60 KEYS: power down -> usage 0x30 (sweet_hid_key 0 1)
+
+如果按下电源键时"pon rt"打出的是别的位（比如 flip 0x01），把 k60keyspwbit
+改成那个位号即可，不需要改代码。
+
+校验：check-hunks.py 0 bad；干净基线 0241 0242 0243 0246 0248 0251 逐行 OK；
+k60_keys.c / sweet_keys.c 在宿主用 gcc -fsyntax-only 配 stub 过（无 error、
+无 warning）。未上机。
+diff --git a/bsd/sys/k60_keys.h b/bsd/sys/k60_keys.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/sys/k60_keys.h
+@@ -0,0 +1,150 @@
++/*
++ * K60（mondrian，SM8475 / cape）物理按键的硬件常量与模块接口。
++ *
++ * 三条键、两处来源，每一处都能在 ~/hackios/dump/live.dts 里找到出处，
++ * 推断出来的地方在下面逐行注明（"实测" / "DT" / "推断"）。
++ *
++ *   电源键      PMK8350 PON（SPMI SID 0 / periph 0x13）的 kpdpwr 状态
++ *   音量减(?)   同一个 PON 的 resin 状态（DT 给 resin 的就是 KEY_VOLDOWN）
++ *   音量加      PM8350（SID 1）的 PMIC GPIO6，低有效、上拉、输入
++ *
++ * 为什么不走 TLMM：live FDT 的 gpio_keys/vol_up 是
++ * `gpios = <0x57b 0x06 0x01>`，0x57b 是同一个 pmic 节点里的 pinctrl@8800
++ * （compatible "qcom,pm8350-gpio"），不是 TLMM 的 gpio 控制器。TLMM
++ * （0x0f100000）上没有这条键，去那里读只会读到别的脚。
++ */
++#ifndef _SYS_K60_KEYS_H_
++#define _SYS_K60_KEYS_H_
++
++#include <stdint.h>
++
++/* ------------------------------------------------------------------ *
++ * SPMI 仲裁器
++ *
++ * live FDT qcom,spmi@c42d000 的 reg/reg-names：
++ *   cnfg 0xc42d000 0x4000, core 0xc400000 0x3000, chnls 0xc500000 0x400000,
++ *   obsrvr 0xc440000 0x80000, intr 0xc4c0000 0x10000
++ * 只碰 core / cnfg / obsrvr 这三段，和 0062（sweet_spmi.c）、0062（sweet_keys.c）
++ * 用的是同一组地址；0251 不映射任何新的 MMIO 窗口。
++ *
++ * 表项格式沿用 sweet_keys.c / sweet_spmi.c：
++ *   core + 0x900 + 4*i   bit8..19 = PPID（sid<<8 | periph）
++ *   cnfg + 0x700 + 4*i   bit0..2  = owner EE（0 = APSS）
++ * ------------------------------------------------------------------ */
++
++#define K60_KEYS_CORE_PA	0x0c400000u
++#define K60_KEYS_CNFG_PA	0x0c42d000u
++#define K60_KEYS_OBS_PA		0x0c440000u
++#define K60_KEYS_NO_APID	0xffffu
++
++/* ------------------------------------------------------------------ *
++ * 电源键 / 音量减：PMK8350 的 PON
++ *
++ * live FDT（DT 依据，不是推断）：
++ *   qcom,pmk8350@0 { reg = <0x00 0x00>;            // SPMI USID 0
++ *     pon_hlos@1300 {
++ *       compatible = "qcom,pm8998-pon";
++ *       reg = <0x1300 0x800>; reg-names = "pon_hlos", "pon_pbs";
++ *       pwrkey      { interrupts = <0x00 0x13 0x07 0x03>; linux,code = <0x74>; }
++ *       resin       { interrupts = <0x00 0x13 0x06 0x03>; linux,code = <0x72>; }
++ *       pwrkey-bark { interrupts = <0x00 0x13 0x00 0x03>; }
++ *       pwrkey-resin-bark { interrupts = <0x00 0x13 0x02 0x03>; }
++ *     };
++ *
++ * SPMI 中断说明符是 <USID periph irq type>，所以：
++ *   - APPS 这一侧的 PON 外设 = SID 0 / periph 0x13（就是 pon_hlos@1300 的
++ *     高字节），kpdpwr = 该外设的 7 号中断，resin = 6 号中断；
++ *   - pon_pbs@800 是 PBS 那一侧的 PON 页 = periph 0x08。sweet_keys.c 里的
++ *     KEYS_PON_RT 0x0810 正好落在这个页上：那是 PBS 的 PON，APPS 读不到
++ *     按键状态（这也解释了它在本机上为什么一直读失败）。
++ *
++ * linux,code 0x74 = KEY_POWER(116)、0x72 = KEY_VOLDOWN(114)：这台机器的
++ * 音量减挂在 PON 的 resin 上，和很多高通机器一样。
++ *
++ * 寄存器偏移 0x10 = INT_RT_STS（SPMI 外设的中断块固定从 0x10 开始，实时状态
++ * 位按下标对应中断号）。所以按键状态 = periph 0x13 的 0x10：
++ *   bit7 = kpdpwr（电源键）、bit6 = resin（音量减）。
++ * 这一条是**推断**：本机没有 PMK8350 的寄存器手册，依据是同族 PON 的
++ * 0x10/位号=中断号约定（0062 的 sweet_keys.c 在没有手册的 sweet 板上就是这么
++ * 用的，且实测能报键），以及本机 DT 给的 7/6 两个中断号。若上机日志显示按下
++ * 电源键时变的是别的位，用 k60keyspwbit= / k60keysresbit= 改位号即可，
++ * 不需要改代码 —— 每次变化都会把"整字节 + 翻转位掩码"打出来。
++ * ------------------------------------------------------------------ */
++
++#define K60_KEYS_PON_PPID	0x0013u		/* SID 0, periph 0x13 */
++#define K60_KEYS_PON_INT_RT	0x10u		/* 外设内偏移：INT_RT_STS */
++#define K60_KEYS_PON_RT		0x1310u		/* 整地址 = (periph<<8)|0x10 */
++#define K60_KEYS_PON_PWR_BIT	7		/* 推断：kpdpwr = irq 7 */
++#define K60_KEYS_PON_RES_BIT	6		/* 推断：resin  = irq 6 */
++
++/* ------------------------------------------------------------------ *
++ * 音量加：PM8350（SID 1）的 PMIC GPIO6
++ *
++ * live FDT（DT 依据）：
++ *   gpio_keys { compatible = "gpio-keys";
++ *     vol_up { gpios = <0x57b 0x06 0x01>; linux,code = <0x73>;  // KEY_VOLUMEUP
++ *              debounce-interval = <0x20>; }; };
++ *   qcom,pm8350@1 { reg = <0x01 0x00>;                            // SPMI USID 1
++ *     pinctrl@8800 { compatible = "qcom,pm8350-gpio"; reg = <0x8800>; phandle = <0x57b>; } };
++ *   key_vol_up_default { pins = "gpio6"; function = "normal";
++ *                        input-enable; bias-pull-up; power-source = <0x01>; };
++ *
++ * 由 gpios 的第三项 0x01 = GPIO_ACTIVE_LOW 可知：按下 = 引脚被拉到低。
++ * pinctrl@8800 的 reg 就是这一组 GPIO 页的 SPMI 地址；GPIO1 = 0x8800、
++ * 每脚 0x100 字节，所以 GPIO6 = 0x8d00，页内 INT_RT_STS 在 0x10，配置寄存器
++ * 在 0x40 起（MODE_CTL 0x40 / DIG_PULL_CTL 0x42 / DIG_IN_CTL 0x43 /
++ * EN_CTL 0x46）—— 和 0062 在 sweet 板上用过的 0xc140/0xc146/0xc105 是同一套
++ * 页内偏移，只是换了页基址。
++ *
++ * 页内偏移那一组是**推断**（同族 PMIC GPIO 的固定布局）；页基址 0x8d00 是
++ * DT 给的。为了不把"地址猜错"变成"乱报按键"，模块在启用音量加之前会回读
++ * EN_CTL/MODE_CTL/PERPH_SUBTYPE 确认这一页确实被固件配成"输入 + 打开"，
++ * 对不上就整条键都不上报，只打印探测结果。
++ * ------------------------------------------------------------------ */
++
++#define K60_KEYS_GPIO1_BASE	0x8800u		/* pinctrl@8800 = GPIO1 的页 */
++#define K60_KEYS_GPIO_PAGE	0x100u		/* 每脚一页 */
++#define K60_KEYS_VUP_PIN	6
++
++#define K60_KEYS_VUP_PPID	0x018du		/* SID 1, periph 0x8d */
++#define K60_KEYS_VUP_BASE	(K60_KEYS_GPIO1_BASE + \
++				 K60_KEYS_GPIO_PAGE * (K60_KEYS_VUP_PIN - 1)) /* 0x8d00 */
++#define K60_KEYS_VUP_RT		0x8d10u		/* INT_RT_STS，bit0 = 该脚 */
++#define K60_KEYS_VUP_MODE	0x8d40u		/* MODE_CTL：方向位域 */
++#define K60_KEYS_VUP_PULL	0x8d42u		/* DIG_PULL_CTL：bit0-2 上下拉 */
++#define K60_KEYS_VUP_DIN	0x8d43u		/* DIG_IN_CTL：bit0 送进中断逻辑 */
++#define K60_KEYS_VUP_EN		0x8d46u		/* EN_CTL：bit7 总开关 */
++#define K60_KEYS_VUP_SUBTYPE	0x8d05u		/* PERPH_SUBTYPE：决定方向位域怎么解 */
++
++#define K60_KEYS_PULL_UP	3u		/* DIG_PULL_CTL 的"上拉"取值 */
++
++/* ------------------------------------------------------------------ *
++ * 上报
++ *
++ * SweetHID.cpp 的 sweet_hid_key(key, down)：0 = 电源 0x30、
++ * 1 = 音量加 0xe9、2 = 音量减 0xea（consumer page 0x0c）。
++ * ------------------------------------------------------------------ */
++
++#define K60_KEY_POWER		0
++#define K60_KEY_VOL_UP		1
++#define K60_KEY_VOL_DOWN	2
++
++#define K60_KEY_USAGE_POWER	0x30
++#define K60_KEY_USAGE_VOL_UP	0xe9
++#define K60_KEY_USAGE_VOL_DOWN	0xea
++
++/* ------------------------------------------------------------------ *
++ * 时序
++ * ------------------------------------------------------------------ */
++
++#define K60_KEYS_BOOT_DELAY_S	20	/* 和 k60_touch 一致：等 GUI 起来、日志落盘 */
++#define K60_KEYS_PERIOD_MS	25	/* 轮询周期；PON/GPIO 两边都有硬件去抖 */
++
++/* 本模块是否接管了这块板子的按键：k60_keys_init() 在 SPMI 仲裁器里找到
++ * K60 的 PON lane（PPID 0x013）之后置 1；sweet_keys.c 看到就让位，避免两个
++ * 线程在同一批 obsrvr 通道上互相踩（也会避免它把 PBS 的 PON 页当成按键）。 */
++extern int k60_keys_owns_board;
++
++void k60_keys_init(void);
++
++#endif /* _SYS_K60_KEYS_H_ */
+diff --git a/bsd/dev/k60_keys.c b/bsd/dev/k60_keys.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/k60_keys.c
+@@ -0,0 +1,560 @@
++/*
++ * K60（mondrian，SM8475）物理按键：PON 的电源键/音量减 + PMIC GPIO 的音量加。
++ *
++ * 挂法和 sweet_keys_init() / k60_touch_init() 一样，由 bsd/dev/sweet_ufs.c 在
++ * 根设备就位之后调用，但**排在 sweet_keys_init() 前面**：本模块一探到 K60 的
++ * PON lane 就置 k60_keys_owns_board，sweet_keys.c 看到就整段让位（它找的是
++ * sweet 板的 PON 0x008 和 PM6150L 的 GPIO 0xc1，在这台机器上前者是 PBS 的
++ * PON 页、后者根本不存在，留着只会读垃圾并和这里抢 obsrvr 通道）。
++ *
++ * 两条读路径，分工是有原因的：
++ *   PON（periph 0x13，SID 0）走 sweet_spmi_read()。SweetBattery 也在读
++ *   0x13，同一个 PPID 的 EXT_READL 通道只能有一条线程在里面，所以必须走
++ *   sweet_spmi.c 那把 IOLock，而不是自己再开一套。
++ *   音量加的 GPIO（periph 0x8d，SID 1）自己读：sweet_spmi_read() 的门禁只
++ *   放行 0x10-0x13/0x48 这几个电池外设，而这条 lane 没有第二个人用，自己发
++ *   EXT_READL 不会和谁撞。
++ *
++ * 全程只读：唯一的 MMIO 写是 obsrvr 通道上的 EXT_READL 命令字，一个 PMIC
++ * 配置寄存器都不碰（不使能、不去抖、不 ack 中断、不清 latch）。
++ *
++ * 判据行（都是 K60 KEYS: 开头，每行之后落盘）：
++ *   "K60 KEYS: init: ..."                 参数与 lane
++ *   "K60 KEYS: arb=... pon(0x13)-apid=..."  仲裁器版本、两个 lane 的 APID
++ *   "K60 KEYS: gpio6 ... subtype/mode/en"  音量加那一页的固件配置（判据）
++ *   "K60 KEYS: pon rt idle ..."            电源键/音量减的起始字节
++ *   "K60 KEYS: pon rt 0x.. -> 0x.. (flip)" 电源键/音量减的变化（整字节）
++ *   "K60 KEYS: gpio6 rt 0x.. -> 0x.."      音量加的变化
++ *   "K60 KEYS: <键> down|up -> usage ..."  判定 + 上报的 usage
++ *   "K60 KEYS: ... withheld"               哪条键因为配置对不上没有上报
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/k60_keys.h>
++#include <sys/k60_touch.h>		/* k60_touch_sleep_ms() */
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++
++#include "sweet_spmi.h"			/* sweet_spmi_init()/sweet_spmi_read() */
++
++extern void sweet_hid_key(int key, int down);
++extern void sweet_log_flush_now(void);
++
++/* sweet_keys.c 看到这个就整段让位。1 表示这台板子的按键由本文件负责。 */
++int k60_keys_owns_board = 0;
++
++static struct {
++	int started;
++	int delay_s;
++	int period_ms;
++	int pw_bit;
++	int res_bit;
++	int probe;
++} k60k;
++
++/* 轮询状态。只有一条线程写它们。 */
++static struct {
++	uint8_t pon_rt;
++	uint8_t vup_rt;
++	bool pon_known;
++	bool vup_known;
++	bool vup_usable;
++	bool reported[3];		/* 下标同 K60_KEY_*，只对上报过的键发 up */
++	unsigned pon_fail;
++	bool spmi_retried;
++} ks;
++
++static vm_offset_t keys_core, keys_cnfg, keys_obs;
++static uint16_t keys_pon_apid = K60_KEYS_NO_APID;
++static uint16_t keys_vup_apid = K60_KEYS_NO_APID;
++static uint32_t keys_version, keys_count;
++static bool keys_vup_poisoned;
++
++static const char *const keys_name[3] = {
++	"power", "volume up", "volume down",
++};
++
++static const uint32_t keys_usage[3] = {
++	K60_KEY_USAGE_POWER, K60_KEY_USAGE_VOL_UP, K60_KEY_USAGE_VOL_DOWN,
++};
++
++static void
++keys_flush(void)
++{
++	/*
++	 * 按键日志跟 k60_touch 一样每行落盘：这些行是上机唯一的判据，掉在
++	 * 缓冲里等于没打。频率由按键决定（一次按下两行），不担心开销。
++	 */
++	sweet_log_flush_now();
++}
++
++static uint32_t
++keys_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t value = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return value;
++}
++
++/* v5 可以给一个 PPID 映射多个 APID；优先要 owner 是 APSS(0) 的那个。 */
++static uint16_t
++keys_find_apid(uint16_t ppid)
++{
++	uint16_t found = K60_KEYS_NO_APID;
++
++	for (uint32_t i = 0; i < keys_count; ++i) {
++		uint32_t map = keys_rd(keys_core, 0x900u + 4u * i);
++
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		uint32_t owner = keys_rd(keys_cnfg, 0x700u + 4u * i) & 7u;
++		if (found == K60_KEYS_NO_APID || owner == 0) {
++			found = (uint16_t)i;
++		}
++	}
++	return found;
++}
++
++static unsigned
++keys_find_owner(uint16_t apid)
++{
++	if (apid == K60_KEYS_NO_APID || apid >= keys_count) {
++		return 0xffu;
++	}
++	return keys_rd(keys_cnfg, 0x700u + 4u * apid) & 7u;
++}
++
++/*
++ * EXT_READL，一个字节。命令字和 sweet_spmi.c/sweet_keys.c 逐位相同：
++ * bit27 = 读，bit4..11 = 寄存器地址，BC=0 表示 1 字节。
++ * 只用于 0x8d 这条没人共用的 lane，所以不加锁。
++ */
++static bool
++keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
++{
++	if (apid == K60_KEYS_NO_APID) {
++		return false;
++	}
++	uint32_t off = 0x80u * apid;	/* obsrvr + EE(0)*0x10000 */
++	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
++
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(keys_obs + off) = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = keys_rd(keys_obs, off + 0x08u);
++
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/*
++ * PON 只有一个字节的读取入口：整份 sweet_spmi.c 都靠 sp_lock 串行化，
++ * 这里绕过去就等于两条线程往同一个通道写命令字。
++ *
++ * sweet_spmi_read() 还要求 sweet_spmi_init() 先跑过（那个由 SweetBattery
++ * 负责）。如果电池 personality 没起来，第一次失败之后补一次 init 再重试，
++ * 免得"电源键不工作"被误当成寄存器问题。
++ */
++static bool
++keys_read_pon(uint16_t addr, uint8_t *out)
++{
++	if (sweet_spmi_read(0, addr, out) == 0) {
++		return true;
++	}
++	if (!ks.spmi_retried) {
++		int r;
++
++		ks.spmi_retried = true;
++		r = sweet_spmi_init();
++		printf("K60 KEYS: pon read failed, sweet_spmi_init() = %d "
++		    "(0 = the battery half was not up yet)\n", r);
++		keys_flush();
++		if (r == 0 && sweet_spmi_read(0, addr, out) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* 判定 + 上报。一行里给全：哪个键、按下还是松开、报的是哪个 usage。 */
++static void
++keys_action(int key, int down)
++{
++	printf("K60 KEYS: %s %s -> usage 0x%02x (sweet_hid_key %d %d)\n",
++	    keys_name[key], down ? "down" : "up", keys_usage[key], key, down);
++	keys_flush();
++	sweet_hid_key(key, down != 0);
++}
++
++/*
++ * 一条键的边沿。只有真上报过 down 的键才发 up：开机时按着电源键不放的话，
++ * 第一次采样就是"已按下"，那次按下不是这次 boot 里发生的，不发（也不发
++ * 一个没有 down 的 up，免得 HID 那边看到孤立事件）。
++ */
++static void
++keys_key_state(int key, int down)
++{
++	down = down != 0;
++	if (down == ks.reported[key]) {
++		if (!down) {
++			printf("K60 KEYS: %s was down before this driver looked, "
++			    "release not reported\n", keys_name[key]);
++			keys_flush();
++		}
++		return;
++	}
++	ks.reported[key] = down;
++	keys_action(key, down);
++}
++
++static void
++keys_pon_update(uint8_t pon)
++{
++	uint8_t flip;
++	int pwr = (pon >> (k60k.pw_bit & 7)) & 1u;
++	int res = (pon >> (k60k.res_bit & 7)) & 1u;
++
++	if (!ks.pon_known) {
++		ks.pon_known = true;
++		ks.pon_rt = pon;
++		printf("K60 KEYS: pon rt idle 0x%02x, power = bit%d (%d), "
++		    "volume down = bit%d (%d)\n", pon, k60k.pw_bit & 7, pwr,
++		    k60k.res_bit & 7, res);
++		keys_flush();
++		return;
++	}
++	flip = (uint8_t)(pon ^ ks.pon_rt);
++	if (flip == 0) {
++		return;
++	}
++	printf("K60 KEYS: pon rt 0x%02x -> 0x%02x (flip 0x%02x)\n",
++	    ks.pon_rt, pon, flip);
++	ks.pon_rt = pon;
++	if (flip & (1u << (k60k.pw_bit & 7))) {
++		printf("K60 KEYS: pon bit%d is now %d\n",
++		    k60k.pw_bit & 7, pwr);
++		keys_key_state(K60_KEY_POWER, pwr);
++	}
++	if (flip & (1u << (k60k.res_bit & 7))) {
++		printf("K60 KEYS: pon bit%d is now %d\n",
++		    k60k.res_bit & 7, res);
++		keys_key_state(K60_KEY_VOL_DOWN, res);
++	}
++}
++
++/* DT 说这一页是"输入 + 上拉 + 低有效"，按下 = bit0 变 0。 */
++static void
++keys_vup_update(uint8_t rt)
++{
++	int pressed = !(rt & 1u);
++
++	if (!ks.vup_known) {
++		ks.vup_known = true;
++		ks.vup_rt = rt;
++		printf("K60 KEYS: gpio6 rt idle 0x%02x (bit0 %u = %s, active low)\n",
++		    rt, rt & 1u, (rt & 1u) ? "released" : "pressed");
++		keys_flush();
++		return;
++	}
++	if (rt == ks.vup_rt) {
++		return;
++	}
++	printf("K60 KEYS: gpio6 rt 0x%02x -> 0x%02x (bit0 %u = %s, active low)\n",
++	    ks.vup_rt, rt, rt & 1u, (rt & 1u) ? "released" : "pressed");
++	ks.vup_rt = rt;
++	keys_key_state(K60_KEY_VOL_UP, pressed);
++}
++
++static void
++keys_poll(void)
++{
++	uint8_t pon = 0, vup = 0;
++
++	if (!keys_read_pon(K60_KEYS_PON_RT, &pon)) {
++		if ((ks.pon_fail++ % 200u) == 0u) {
++			printf("K60 KEYS: pon 0x%04x unreadable (%u tries); "
++			    "power/volume down stay silent\n",
++			    K60_KEYS_PON_RT, ks.pon_fail);
++			keys_flush();
++		}
++	} else {
++		ks.pon_fail = 0;
++		keys_pon_update(pon);
++	}
++	if (!ks.vup_usable) {
++		return;
++	}
++	if (keys_vup_poisoned) {
++		return;
++	}
++	if (!keys_read(keys_vup_apid, K60_KEYS_VUP_RT, &vup)) {
++		/* 超时的通道可能迟到才完成，这条 boot 里不再用它。 */
++		keys_vup_poisoned = true;
++		printf("K60 KEYS: gpio6 0x%04x timed out, volume up dropped "
++		    "for this boot\n", K60_KEYS_VUP_RT);
++		keys_flush();
++		return;
++	}
++	keys_vup_update(vup);
++}
++
++/*
++ * 只读探测：仲裁器表里跟按键有关的那几条 PPID、PON 的 0x00-0x1f、以及
++ * 0x88-0x93 这十二个 GPIO 页的 RT/MODE/EN。用来在没有手册的情况下确认
++ * 页基址（0x8d）和"输入 + 上拉"的位域，任何一条都不写。
++ */
++static void
++keys_probe_dump(void)
++{
++	static const uint16_t ppids[] = {
++		0x0008, 0x0010, 0x0011, 0x0012, 0x0013, 0x0031,	/* SID 0 */
++		0x0188, 0x0189, 0x018a, 0x018b, 0x018c, 0x018d,	/* SID 1 GPIO1-6 */
++		0x018e, 0x018f, 0x0190, 0x0191, 0x0192, 0x0193,	/* SID 1 GPIO7-12 */
++	};
++	uint8_t value = 0;
++
++	printf("K60 KEYS: probe: arb=%#x apids=%u, core 0x%lx cnfg 0x%lx obs 0x%lx\n",
++	    keys_version, keys_count, (unsigned long)keys_core,
++	    (unsigned long)keys_cnfg, (unsigned long)keys_obs);
++	keys_flush();
++	for (unsigned i = 0; i < sizeof(ppids) / sizeof(ppids[0]); ++i) {
++		uint16_t apid = keys_find_apid(ppids[i]);
++
++		if (apid == K60_KEYS_NO_APID) {
++			printf("K60 KEYS: probe ppid 0x%04x absent\n", ppids[i]);
++		} else {
++			printf("K60 KEYS: probe ppid 0x%04x apid=%u owner=%u\n",
++			    ppids[i], apid, keys_find_owner(apid));
++		}
++	}
++	keys_flush();
++	for (unsigned reg = 0; reg < 0x20; ++reg) {
++		if (keys_read_pon((uint16_t)(0x1300u | reg), &value)) {
++			printf("K60 KEYS: probe pon[0x%02x] = 0x%02x\n",
++			    reg, value);
++		} else {
++			printf("K60 KEYS: probe pon[0x%02x] = unreadable\n", reg);
++		}
++	}
++	keys_flush();
++	for (unsigned pin = 1; pin <= 12; ++pin) {
++		uint16_t ppid = (uint16_t)(0x0180u | (0x08u + pin - 1u));
++		uint16_t apid = keys_find_apid(ppid);
++		uint16_t page = (uint16_t)(K60_KEYS_GPIO1_BASE +
++		    K60_KEYS_GPIO_PAGE * (pin - 1u));
++		uint8_t sub = 0, mode = 0, en = 0, pull = 0, din = 0, rt = 0;
++		bool ok;
++
++		if (apid == K60_KEYS_NO_APID) {
++			printf("K60 KEYS: probe gpio%u ppid 0x%04x absent\n",
++			    pin, ppid);
++			continue;
++		}
++		ok = keys_read(apid, (uint16_t)(page + 0x05u), &sub) &&
++		    keys_read(apid, (uint16_t)(page + 0x10u), &rt) &&
++		    keys_read(apid, (uint16_t)(page + 0x40u), &mode) &&
++		    keys_read(apid, (uint16_t)(page + 0x42u), &pull) &&
++		    keys_read(apid, (uint16_t)(page + 0x43u), &din) &&
++		    keys_read(apid, (uint16_t)(page + 0x46u), &en);
++		printf("K60 KEYS: probe gpio%u apid=%u ok=%d sub=%#x rt=%#x "
++		    "mode=%#x pull=%#x din=%#x en=%#x\n", pin, apid, ok, sub,
++		    rt, mode, pull, din, en);
++	}
++	keys_flush();
++}
++
++/*
++ * 音量加那一页的固件配置检查。方向位域的解法与 0062 的 sweet_keys.c 一致
++ * （两个 GPIO IP 版本的 MODE_CTL 布局不同，用 PERPH_SUBTYPE 区分）。
++ * 对不上就不启用这条键 —— 宁可少一条键，也不要把别的引脚的变化报成音量加。
++ */
++static int
++keys_vup_check(void)
++{
++	uint8_t sub = 0, mode = 0, en = 0, pull = 0, din = 0;
++	unsigned dir;
++
++	if (keys_vup_apid == K60_KEYS_NO_APID) {
++		printf("K60 KEYS: volume up withheld: ppid 0x%04x is not in the "
++		    "arbiter table\n", K60_KEYS_VUP_PPID);
++		keys_flush();
++		return -1;
++	}
++	if (!keys_read(keys_vup_apid, K60_KEYS_VUP_SUBTYPE, &sub) ||
++	    !keys_read(keys_vup_apid, K60_KEYS_VUP_MODE, &mode) ||
++	    !keys_read(keys_vup_apid, K60_KEYS_VUP_EN, &en) ||
++	    !keys_read(keys_vup_apid, K60_KEYS_VUP_PULL, &pull) ||
++	    !keys_read(keys_vup_apid, K60_KEYS_VUP_DIN, &din)) {
++		printf("K60 KEYS: volume up withheld: gpio6 page 0x%04x unreadable\n",
++		    K60_KEYS_VUP_BASE);
++		keys_flush();
++		return -1;
++	}
++	dir = (sub >= 0x10u && sub <= 0x13u) ? (mode & 3u) : ((mode >> 4) & 7u);
++	printf("K60 KEYS: gpio6 page 0x%04x subtype=%#x mode=%#x dir=%u en=%#x "
++	    "pull=%#x din=%#x\n", K60_KEYS_VUP_BASE, sub, mode, dir, en, pull,
++	    din);
++	keys_flush();
++	if (!(en & 0x80u)) {
++		printf("K60 KEYS: volume up withheld: EN_CTL 0x%02x has no "
++		    "master enable\n", en);
++		keys_flush();
++		return -1;
++	}
++	if (dir != 0u && dir != 2u) {
++		printf("K60 KEYS: volume up withheld: MODE_CTL says function %u, "
++		    "not a digital input\n", dir);
++		keys_flush();
++		return -1;
++	}
++	if ((pull & 7u) != K60_KEYS_PULL_UP) {
++		/* DT 写的是 bias-pull-up；固件用 keeper 也能工作，只提醒不拦。 */
++		printf("K60 KEYS: note: pull=%#x is not the DT's bias-pull-up(3), "
++		    "still watching the pin\n", pull & 7u);
++		keys_flush();
++	}
++	return 0;
++}
++
++static void
++k60_keys_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	printf("K60 KEYS: starting in %d s, every %d ms (power = pon 0x%04x "
++	    "bit%d, volume down = pon 0x%04x bit%d, volume up = gpio ppid 0x%04x)\n",
++	    k60k.delay_s, k60k.period_ms, K60_KEYS_PON_RT, k60k.pw_bit & 7,
++	    K60_KEYS_PON_RT, k60k.res_bit & 7, K60_KEYS_VUP_PPID);
++	keys_flush();
++	k60_touch_sleep_ms((uint32_t)k60k.delay_s * 1000u);
++
++	if (k60k.probe) {
++		keys_probe_dump();
++	}
++	ks.vup_usable = keys_vup_check() == 0;
++	if (!ks.vup_usable && !k60k.probe) {
++		/* 配置对不上时把十二个候选页打出来，下一次 boot 就知道该看哪一页。 */
++		printf("K60 KEYS: dumping the gpio candidates for the next boot\n");
++		keys_flush();
++		keys_probe_dump();
++	}
++	printf("K60 KEYS: polling (volume up %s, pon %s)\n",
++	    ks.vup_usable ? "armed" : "off",
++	    keys_pon_apid != K60_KEYS_NO_APID ? "armed" : "off");
++	keys_flush();
++	for (;;) {
++		keys_poll();
++		k60_touch_sleep_ms((uint32_t)k60k.period_ms);
++	}
++}
++
++void
++k60_keys_init(void)
++{
++	thread_t thread;
++	kern_return_t kr;
++	int enabled = 1;
++
++	if (k60k.started) {
++		return;
++	}
++	k60k.started = 1;
++	k60k.delay_s = K60_KEYS_BOOT_DELAY_S;
++	k60k.period_ms = K60_KEYS_PERIOD_MS;
++	k60k.pw_bit = K60_KEYS_PON_PWR_BIT;
++	k60k.res_bit = K60_KEYS_PON_RES_BIT;
++
++	if (PE_parse_boot_argn("k60keys", &enabled, sizeof(enabled)) &&
++	    enabled == 0) {
++		printf("K60 KEYS: disabled by k60keys=0\n");
++		return;
++	}
++	(void)PE_parse_boot_argn("k60keysdelay", &k60k.delay_s,
++	    sizeof(k60k.delay_s));
++	(void)PE_parse_boot_argn("k60keysperiod", &k60k.period_ms,
++	    sizeof(k60k.period_ms));
++	(void)PE_parse_boot_argn("k60keysprobe", &k60k.probe,
++	    sizeof(k60k.probe));
++	(void)PE_parse_boot_argn("k60keyspwbit", &k60k.pw_bit,
++	    sizeof(k60k.pw_bit));
++	(void)PE_parse_boot_argn("k60keysresbit", &k60k.res_bit,
++	    sizeof(k60k.res_bit));
++	/* 越界的不猜，夹回能用的范围。 */
++	if (k60k.delay_s < 0) {
++		k60k.delay_s = 0;
++	}
++	if (k60k.period_ms < 5) {
++		k60k.period_ms = 5;
++	}
++	if (k60k.period_ms > 1000) {
++		k60k.period_ms = 1000;
++	}
++	k60k.pw_bit &= 7;
++	k60k.res_bit &= 7;
++
++	/* 和 sweet_spmi.c/sweet_keys.c 完全相同的三段窗口，不新增任何映射。 */
++	keys_core = ml_io_map(K60_KEYS_CORE_PA, 0x2000);
++	keys_cnfg = ml_io_map(K60_KEYS_CNFG_PA, 0x1000);
++	keys_obs = ml_io_map(K60_KEYS_OBS_PA, 0x10000);
++	if (!keys_core || !keys_cnfg || !keys_obs) {
++		printf("K60 KEYS: MMIO mapping failed\n");
++		return;
++	}
++	keys_version = keys_rd(keys_core, 0);
++	keys_count = keys_rd(keys_core, 4) & 0x7ffu;
++	if (keys_version < 0x50000000u || keys_version >= 0x70000000u ||
++	    keys_count == 0 || keys_count > 512) {
++		printf("K60 KEYS: unsupported arbiter version=%#x apids=%u\n",
++		    keys_version, keys_count);
++		return;
++	}
++	keys_pon_apid = keys_find_apid(K60_KEYS_PON_PPID);
++	keys_vup_apid = keys_find_apid(K60_KEYS_VUP_PPID);
++	printf("K60 KEYS: init: arb=%#x apids=%u pon(ppid 0x%04x) apid=%u "
++	    "owner=%u, volume up(ppid 0x%04x) apid=%u owner=%u, delay %d s, "
++	    "period %d ms\n", keys_version, keys_count, K60_KEYS_PON_PPID,
++	    keys_pon_apid, keys_find_owner(keys_pon_apid), K60_KEYS_VUP_PPID,
++	    keys_vup_apid, keys_find_owner(keys_vup_apid), k60k.delay_s,
++	    k60k.period_ms);
++	keys_flush();
++	/*
++	 * 找到 PON lane 就等于确认"这台是 K60 的 PMIC 拓扑"，从这一刻起
++	 * sweet_keys_init() 会直接让位（它排在后面调用）。
++	 */
++	if (keys_pon_apid != K60_KEYS_NO_APID) {
++		k60_keys_owns_board = 1;
++	} else {
++		printf("K60 KEYS: no PON lane, sweet_keys keeps the board\n");
++	}
++	/* 两条 lane 都没有：这不是本机的 PMIC 拓扑，别起一条只会打日志的线程。 */
++	if (keys_pon_apid == K60_KEYS_NO_APID &&
++	    keys_vup_apid == K60_KEYS_NO_APID) {
++		printf("K60 KEYS: nothing to poll, thread not started\n");
++		keys_flush();
++		return;
++	}
++	kr = kernel_thread_start(k60_keys_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("K60 KEYS: kernel_thread_start failed %d\n", kr);
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@ bsd/dev/k60_touch_rpmh.c		standard
+ bsd/dev/k60_touch_geni.c		standard
+ bsd/dev/k60_touch_goodix.c		standard
+ bsd/dev/k60_touch.c			standard
++bsd/dev/k60_keys.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -7,6 +7,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/k60_keys.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -132,16 +133,31 @@ void
+ sweet_keys_init(void)
+ {
+ 	int enabled = 1;
++	int forced = 0;
+ 	thread_t thread;
+ 	if (keys_started) {
+ 		return;
+ 	}
+ 	keys_started = true;
+-	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
++	if (PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled))) {
++		forced = 1;
++	}
+ 	if (!enabled) {
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+ 	}
++	/*
++	 * 0251：这台机器的 PON 在 pmk8350 的 periph 0x13（pon_hlos@1300），
++	 * 不是这里的 0x008 —— 0x0810 落在 pon_pbs@800，那是 PBS 的页，APPS
++	 * 读不到键状态；音量加也不在 PM6150L 的 4/0xc1，而在 pm8350 的
++	 * GPIO6（页 0x8d00）。bsd/dev/k60_keys.c 探到那条 lane 后就来接管，
++	 * 这里让位：两个线程读同一批 obsrvr 通道会互相踩，读 PBS 的 PON 页
++	 * 还会把无关的位当成按键报出去。sweetkeys=1 仍可强行保留本驱动。
++	 */
++	if (k60_keys_owns_board && !forced) {
++		printf("SWEET KEYS: yields to K60 KEYS (sweetkeys=1 keeps this driver)\n");
++		return;
++	}
+ 	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+ 	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+ 	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void k60_touch_spi_init(void);
+ extern void k60_touch_init(void);
++extern void k60_keys_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -799,6 +800,12 @@ sweet_ufs_init(void)
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
++	/*
++	 * K60 的按键（0251）必须排在 sweet_keys_init() 前面：它探到 PON 的
++	 * periph 0x13 就把 k60_keys_owns_board 置 1，紧接着的
++	 * sweet_keys_init() 看到就让位（那边找的是 sweet 板的 0x008/0xc1）。
++	 */
++	k60_keys_init();
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	k60_touch_spi_init();

@@ -2,6 +2,15 @@
 
 ## Agent handoff / active work (2026-10-15, latest)
 
+### >>> UPDATE 2026-10-31: K60 按键（0251，离线完成，未上机） <<<
+
+- **0062 的按键地址是 sweet 板的**：`xnu/patches/0062` 建的 `bsd/dev/sweet_keys.c` 读 PON 的 `0x0810`（SID 0 / periph 0x08）和 PM6150L 的 SID 4 / periph 0xc1。mondrian 的 live FDT 里 `qcom,pmk8350@0` 的 `pon_hlos@1300`（pwrkey irq 7、resin irq 6，`linux,code` 0x74/0x72）说明 **APPS 侧的 PON 是 periph 0x13**，而 `0x0810` 落在 `pon_pbs@800` —— PBS 的页，APPS 读不到键状态；0xc1 这块 PMIC 上根本不存在（SID 4 是 pmr735a，它的 GPIO 从 0x88 起）。
+- **音量加是 PMIC 引脚，不是 TLMM**：`gpio_keys/vol_up` 的 `gpios = <0x57b 6 1>`，0x57b = `qcom,pm8350@1`（USID 1）自己的 `pinctrl@8800`；`key_vol_up_default` 是 `pins="gpio6" function="normal" input-enable bias-pull-up`，第三项 `1` = ACTIVE_LOW。reg 0x8800 是 GPIO1 的页、每脚 0x100 ⇒ **GPIO6 = 0x8d00**，页内 INT_RT_STS 0x10。TLMM(0x0f100000) 上没有这条键。
+- **`xnu/patches/0251-k60-keys-pon-gpio.patch`**：新增 `bsd/sys/k60_keys.h` + `bsd/dev/k60_keys.c`（20 s 后起的轮询线程，25 ms 一次；PON 走 `sweet_spmi_read()` 共用电锁，GPIO 自己发 EXT_READL），并让 `sweet_keys.c` 探到 PON lane 后**让位**（`sweetkeys=1` 可强留），`sweet_ufs.c` 里在它前面调 `k60_keys_init()`。全程只读、不新增 MMIO 窗口。
+- **推断项（没有手册）**：PON 的 0x10 = INT_RT_STS、位号 = 中断号（⇒ 电源 bit7、音量减 bit6）；GPIO 页内 MODE_CTL 0x40 / DIG_PULL_CTL 0x42 / EN_CTL 0x46。所以音量加在启用前会回读 EN_CTL/MODE_CTL/SUBYPE 确认"输入 + 打开"，对不上就整条不上报并打出 0x88-0x93 十二页的探测结果。位号猜错也不用改代码：`k60keyspwbit=` / `k60keysresbit=`。
+- **上机看**：`K60 KEYS: init: arb=... pon(ppid 0x0013) apid=...`、`K60 KEYS: gpio6 page 0x8d00 subtype=... dir=... en=...`、`K60 KEYS: pon rt idle 0x.., power = bit7 (0), volume down = bit6 (0)`、`K60 KEYS: pon rt 0x00 -> 0x80 (flip 0x80)`、`K60 KEYS: power down -> usage 0x30`。`k60keysprobe=1` 打全套只读探测，`k60keys=0` 关掉。
+- **验证（离线）**：`check-hunks.py` = `hunks checked, 0 bad`；干净基线 0241 0242 0243 0246 0248 0251 逐行 OK（`patch` 与 `git apply` 都试过，结果与工作树逐字节一致）；`k60_keys.c`/`sweet_keys.c` 宿主 `gcc -fsyntax-only -Werror` 干净。**未上机、未 push。**
+
 ### >>> UPDATE 2026-10-31: 壁纸 Plan Z（0249，离线完成，未上机） <<<
 
 - **壁纸黑的根因**：壁纸由 PaperBoard 自己的 FBScene 画，是另一个 IOSurface；`AppleCLCD::present` 只合成 SwapEnd 记录里的那几层，所以锁屏底下什么都没有。Plan Z：内核先铺一张壁纸，再把 UI 按 alpha 做 src-over 叠上去。
