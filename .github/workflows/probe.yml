@@ -2,7 +2,15 @@ name: probe
 on:
   workflow_dispatch:
 jobs:
-  t:
+  linux:
     runs-on: ubuntu-latest
     steps:
       - run: echo alive && uname -a
+  mac13:
+    runs-on: macos-13
+    steps:
+      - run: sw_vers && xcodebuild -version
+  mac15:
+    runs-on: macos-15
+    steps:
+      - run: sw_vers && xcodebuild -version
