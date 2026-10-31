@@ -105,6 +105,22 @@ jobs:
           xcodebuild -version
           xcrun --find iig
 
+      - name: Pin lldbmacros to python 3.11
+        run: |
+          # lldbmacros 的规则是直接执行 core/syntax_checker.py，走的是它自己的
+          # shebang，所以 $GITHUB_PATH 里那个 py311 目录压不住 /opt/homebrew/bin
+          # 上的 python3（runner 上已经是 3.14），kcdata.py 就报 "tab character"。
+          # 直接把 shebang 改成 3.11 的绝对路径，绕开 PATH 顺序。
+          P=/opt/homebrew/opt/python@3.11/bin/python3.11
+          n=0
+          for f in $(grep -rl '^#!/usr/bin/env python3' dxb/xnu/tools/lldbmacros 2>/dev/null); do
+            sed -i '' "1s|.*|#!$P|" "$f"
+            n=$((n+1))
+          done
+          echo "repinned $n lldbmacros scripts"
+          head -1 dxb/xnu/tools/lldbmacros/core/syntax_checker.py
+          "$P" --version
+
       - name: Build
         working-directory: dxb
         env:
