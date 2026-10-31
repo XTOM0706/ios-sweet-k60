@@ -93,6 +93,11 @@ jobs:
           # make runs in this step too: point the system python3 at 3.11 now
           sudo ln -sf /opt/homebrew/opt/python@3.11/bin/python3.11 /usr/local/bin/python3
           sudo ln -sf /opt/homebrew/opt/python@3.11/bin/python3.11 /usr/bin/python3 2>/dev/null || true
+          # dxb/build.sh 会自己往 PATH 前面塞 /opt/homebrew/bin，那个 python3 是
+          # 3.14，lldbmacros 的 syntax_checker 就报 "tab character"。直接换掉。
+          sudo mv /opt/homebrew/bin/python3 /opt/homebrew/bin/python3.orig 2>/dev/null || true
+          sudo ln -sf /opt/homebrew/opt/python@3.11/bin/python3.11 /opt/homebrew/bin/python3
+          /opt/homebrew/bin/python3 --version
           python3 --version
           # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
@@ -111,14 +116,15 @@ jobs:
           # shebang，所以 $GITHUB_PATH 里那个 py311 目录压不住 /opt/homebrew/bin
           # 上的 python3（runner 上已经是 3.14），kcdata.py 就报 "tab character"。
           # 直接把 shebang 改成 3.11 的绝对路径，绕开 PATH 顺序。
+          # 缓存未命中时 dxb/xnu 还不存在（build.sh 自己 clone），这一步就空跑。
           P=/opt/homebrew/opt/python@3.11/bin/python3.11
           n=0
-          for f in $(grep -rl '^#!/usr/bin/env python3' dxb/xnu/tools/lldbmacros 2>/dev/null); do
+          for f in $(grep -rl '^#!/usr/bin/env python3' dxb/xnu/tools/lldbmacros 2>/dev/null || true); do
             sed -i '' "1s|.*|#!$P|" "$f"
             n=$((n+1))
           done
           echo "repinned $n lldbmacros scripts"
-          head -1 dxb/xnu/tools/lldbmacros/core/syntax_checker.py
+          head -1 dxb/xnu/tools/lldbmacros/core/syntax_checker.py 2>/dev/null || echo "no tree yet"
           "$P" --version
 
       - name: Build
