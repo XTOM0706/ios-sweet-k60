@@ -14,7 +14,7 @@ diff --git a/bsd/sys/k60_touch.h b/bsd/sys/k60_touch.h
 diff --git a/bsd/dev/k60_touch_rpmh.c b/bsd/dev/k60_touch_rpmh.c
 --- a/bsd/dev/k60_touch_rpmh.c
 +++ b/bsd/dev/k60_touch_rpmh.c
-@@ -283,3 +283,35 @@
+@@ -283,3 +283,40 @@
  }
  
  #endif /* ARM64_BOARD_CONFIG_SWEET */
