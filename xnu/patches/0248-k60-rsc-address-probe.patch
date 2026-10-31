@@ -26,8 +26,13 @@ diff --git a/bsd/dev/k60_touch_rpmh.c b/bsd/dev/k60_touch_rpmh.c
 +int
 +k60_touch_rsc_probe(void)
 +{
++	/*
++	 * 从 drv-2 那一段开始读（0x17a20000，也就是 pong 那边触摸驱动写死的
++	 * rsc_phys）。偏移 0 是控制器本体的第一页，之前那一读直接 external abort，
++	 * 所以不再碰，只探 TCS 所在的 0x20000 段。
++	 */
 +	static const uint32_t offsets[] = {
-+		0x0, 0x1000, 0x10000, 0x20000, 0x20040, 0x20100, 0x20d00, 0x21000
++		0x20000, 0x20d00, 0x20d14, 0x20d1c, 0x20d20, 0x21000, 0x30000
 +	};
 +
 +	if (k60_rsc == 0) {
