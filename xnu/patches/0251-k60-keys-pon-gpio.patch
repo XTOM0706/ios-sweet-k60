@@ -248,7 +248,7 @@ diff --git a/bsd/dev/k60_keys.c b/bsd/dev/k60_keys.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_keys.c
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,567 @@
 +/*
 + * K60（mondrian，SM8475）物理按键：PON 的电源键/音量减 + PMIC GPIO 的音量加。
 + *
@@ -772,8 +772,12 @@ new file mode 100644
 +	}
 +	keys_version = keys_rd(keys_core, 0);
 +	keys_count = keys_rd(keys_core, 4) & 0x7ffu;
-+	if (keys_version < 0x50000000u || keys_version >= 0x70000000u ||
-+	    keys_count == 0 || keys_count > 512) {
++	/*
++	 * K60 的仲裁器版本读出来是 0x70000000（major 7），原来上界卡在
++	 * 0x70000000 会把它当不支持；APID 数 768 也超过了原来的 512。
++	 */
++	if (keys_version < 0x50000000u || keys_version >= 0x80000000u ||
++	    keys_count == 0 || keys_count > 4096) {
 +		printf("K60 KEYS: unsupported arbiter version=%#x apids=%u\n",
 +		    keys_version, keys_count);
 +		return;
