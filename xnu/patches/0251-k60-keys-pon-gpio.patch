@@ -799,7 +799,7 @@ new file mode 100644
 +		k60_keys_owns_board = 1;
 +	} else {
 +		printf("K60 KEYS: no PON lane, sweet_keys keeps the board\n");
-+	}+
++	}
 +	/*
 +	 * 诊断：APID 表如果不在 0x900（v7 仲裁器可能换了位置），这里把
 +	 * 几个候选窗口和表头一起打出来，一眼就能看出该去哪找。
