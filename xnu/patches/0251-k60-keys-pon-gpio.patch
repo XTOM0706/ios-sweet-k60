@@ -248,7 +248,7 @@ diff --git a/bsd/dev/k60_keys.c b/bsd/dev/k60_keys.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_keys.c
-@@ -0,0 +1,679 @@
+@@ -0,0 +1,680 @@
 +/*
 + * K60（mondrian，SM8475）物理按键：PON 的电源键/音量减 + PMIC GPIO 的音量加。
 + *
@@ -400,7 +400,8 @@ new file mode 100644
 +		return false;
 +	}
 +	uint32_t off = 0x80u * apid;	/* obsrvr + EE(0)*0x10000 */
-+	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
++	/* EXT_READL=0x38，opc 在 [31:27]，u32 下就是 0xC0000000。 */
++	uint32_t cmd = 0xC0000000u | ((uint32_t)(addr & 0xffu) << 4);
 +
 +	__asm__ volatile("dmb oshst" ::: "memory");
 +	*(volatile uint32_t *)(keys_obs + off) = cmd;
@@ -856,12 +857,12 @@ new file mode 100644
 +		 */
 +		{
 +			static const uint32_t cand[] = {
-+				0xC0000000u, 0x38000000u, 0x20000000u, 0x08000000u
++				0x1305u, 0x1310u, 0x8d46u, 0x8d40u, 0x8d10u
 +			};
 +			uint32_t c, k;
 +
-+			printf("K60 KEYS: probe read-cmd candidates on apid %u addr 0x1310\n",
-+			    keys_pon_apid);
++			printf("K60 KEYS: probe reads on apid %u (pon) / %u (gpio)\n",
++			    keys_pon_apid, keys_vup_apid);
 +			for (c = 0; c < sizeof(cand) / sizeof(cand[0]); c++) {
 +				uint32_t cmd = cand[c] | ((0x10u & 0xffu) << 4);
 +				uint32_t off = 0x80u * keys_pon_apid;
@@ -875,8 +876,8 @@ new file mode 100644
 +						break;
 +					}
 +				}
-+				printf("K60 KEYS: probe cmd %#010x status %#x data %#x\n",
-+				    cmd, status,
++				printf("K60 KEYS: probe addr %#06x status %#x data %#x\n",
++				    cand[c], status,
 +				    status & 1u ? keys_rd(keys_obs, off + 0x18u) : 0u);
 +			}
 +			keys_flush();
