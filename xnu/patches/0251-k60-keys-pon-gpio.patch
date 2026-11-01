@@ -248,7 +248,7 @@ diff --git a/bsd/dev/k60_keys.c b/bsd/dev/k60_keys.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_keys.c
-@@ -0,0 +1,567 @@
+@@ -0,0 +1,609 @@
 +/*
 + * K60（mondrian，SM8475）物理按键：PON 的电源键/音量减 + PMIC GPIO 的音量加。
 + *
@@ -799,6 +799,48 @@ new file mode 100644
 +		k60_keys_owns_board = 1;
 +	} else {
 +		printf("K60 KEYS: no PON lane, sweet_keys keeps the board\n");
++	}+
++	/*
++	 * 诊断：APID 表如果不在 0x900（v7 仲裁器可能换了位置），这里把
++	 * 几个候选窗口和表头一起打出来，一眼就能看出该去哪找。
++	 */
++	if (k60k.probe) {
++		uint32_t i, nonzero = 0;
++
++		printf("K60 KEYS: probe version=%#x count=%u, core 0x0-0x1c:",
++		    keys_version, keys_count);
++		for (i = 0; i < 8; i++) {
++			printf(" %#x", keys_rd(keys_core, 4u * i));
++		}
++		printf("\n");
++		printf("K60 KEYS: probe apid map 0x900:");
++		for (i = 0; i < 8; i++) {
++			uint32_t v = keys_rd(keys_core, 0x900u + 4u * i);
++
++			if (v != 0) {
++				nonzero++;
++			}
++			printf(" %#x", v);
++		}
++		printf("\n");
++		printf("K60 KEYS: probe apid map 0x800:");
++		for (i = 0; i < 8; i++) {
++			printf(" %#x", keys_rd(keys_core, 0x800u + 4u * i));
++		}
++		printf("\n");
++		printf("K60 KEYS: probe owner 0x700:");
++		for (i = 0; i < 8; i++) {
++			printf(" %#x", keys_rd(keys_cnfg, 0x700u + 4u * i));
++		}
++		printf("\n");
++		for (i = 0; i < keys_count; i++) {
++			if (keys_rd(keys_core, 0x900u + 4u * i) != 0) {
++				nonzero++;
++			}
++		}
++		printf("K60 KEYS: probe 0x900 nonzero over %u entries: %u\n",
++		    keys_count, nonzero);
++		keys_flush();
 +	}
 +	/* 两条 lane 都没有：这不是本机的 PMIC 拓扑，别起一条只会打日志的线程。 */
 +	if (keys_pon_apid == K60_KEYS_NO_APID &&
