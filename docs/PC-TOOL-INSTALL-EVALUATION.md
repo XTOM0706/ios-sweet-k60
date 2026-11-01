@@ -1,5 +1,11 @@
 # 能不能用爱思/iTools 那类 PC 工具装 App（2026-11-01 纸面论证）
 
+> **同日更新（读镜像实测）**：`usbmuxd` 确实不在镜像里（三层搜索 0 命中），
+> 但 `lockdownd` 自己就在 **TCP 62078** 上监听，而且**绑的是 INADDR_ANY**。
+> 也就是说：只要设备有任何一个 IP 链路（USB-NCM 或真实网络），PC 就能
+> **绕过 usbmuxd 直连 lockdownd**。这条把"先补 usbmuxd"的前提推翻了。
+> 详见 `docs/USBMUX-SERVICE-MAP.md`。
+
 ## 结论
 
 **现在不行，但缺的东西比想象中少。**
