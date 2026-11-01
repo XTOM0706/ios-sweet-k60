@@ -248,7 +248,7 @@ diff --git a/bsd/dev/k60_keys.c b/bsd/dev/k60_keys.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_keys.c
-@@ -0,0 +1,647 @@
+@@ -0,0 +1,679 @@
 +/*
 + * K60（mondrian，SM8475）物理按键：PON 的电源键/音量减 + PMIC GPIO 的音量加。
 + *
@@ -848,6 +848,38 @@ new file mode 100644
 +			if (keys_rd(keys_core, 0x900u + 4u * i) != 0) {
 +				nonzero++;
 +			}
++		}
++		/*
++		 * 读命令的 opcode 试四种编码：EXT_READL 在不同代上是 0x38，
++		 * 位域可能是 [31:27] 或 [30:27]，先用 PON 的 APID 各打一次
++		 * status/data，哪种能回数据就用哪种。
++		 */
++		{
++			static const uint32_t cand[] = {
++				0xC0000000u, 0x38000000u, 0x20000000u, 0x08000000u
++			};
++			uint32_t c, k;
++
++			printf("K60 KEYS: probe read-cmd candidates on apid %u addr 0x1310\n",
++			    keys_pon_apid);
++			for (c = 0; c < sizeof(cand) / sizeof(cand[0]); c++) {
++				uint32_t cmd = cand[c] | ((0x10u & 0xffu) << 4);
++				uint32_t off = 0x80u * keys_pon_apid;
++				uint32_t status = 0;
++
++				*(volatile uint32_t *)(keys_obs + off) = cmd;
++				__asm__ volatile("dsb osh" ::: "memory");
++				for (k = 0; k < 500; k++) {
++					status = keys_rd(keys_obs, off + 0x08u);
++					if (status & 1u) {
++						break;
++					}
++				}
++				printf("K60 KEYS: probe cmd %#010x status %#x data %#x\n",
++				    cmd, status,
++				    status & 1u ? keys_rd(keys_obs, off + 0x18u) : 0u);
++			}
++			keys_flush();
 +		}
 +		printf("K60 KEYS: probe first nonzero at 0x900 (idx raw):\n");
 +		{
