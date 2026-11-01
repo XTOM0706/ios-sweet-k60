@@ -248,7 +248,7 @@ diff --git a/bsd/dev/k60_keys.c b/bsd/dev/k60_keys.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_keys.c
-@@ -0,0 +1,681 @@
+@@ -0,0 +1,691 @@
 +/*
 + * K60（mondrian，SM8475）物理按键：PON 的电源键/音量减 + PMIC GPIO 的音量加。
 + *
@@ -407,7 +407,17 @@ new file mode 100644
 +	__asm__ volatile("dmb oshst" ::: "memory");
 +	*(volatile uint32_t *)(keys_obs + off) = cmd;
 +	__asm__ volatile("dsb osh" ::: "memory");
++	/*
++	 * DONE 是粘的：先等它掉下去（新命令被硬件收下），再等它立起来。
++	 * 直接等 1 会立刻命中上一笔的残留，读到的是旧数据。
++	 */
 +	for (unsigned i = 0; i < 1000; ++i) {
++		if (!(keys_rd(keys_obs, off + 0x08u) & 1u)) {
++			break;
++		}
++		delay(1);
++	}
++	for (unsigned i = 0; i < 2000; ++i) {
 +		uint32_t status = keys_rd(keys_obs, off + 0x08u);
 +
 +		if (status & 1u) {
