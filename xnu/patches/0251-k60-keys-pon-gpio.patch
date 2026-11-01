@@ -248,7 +248,7 @@ diff --git a/bsd/dev/k60_keys.c b/bsd/dev/k60_keys.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_keys.c
-@@ -0,0 +1,680 @@
+@@ -0,0 +1,681 @@
 +/*
 + * K60（mondrian，SM8475）物理按键：PON 的电源键/音量减 + PMIC GPIO 的音量加。
 + *
@@ -399,7 +399,8 @@ new file mode 100644
 +	if (apid == K60_KEYS_NO_APID) {
 +		return false;
 +	}
-+	uint32_t off = 0x80u * apid;	/* obsrvr + EE(0)*0x10000 */
++	/* v7 的观察通道步长是 0x20（v5 是 0x80），EE=0 时不吃 0x8000*ee。 */
++	uint32_t off = 0x20u * apid;
 +	/* EXT_READL=0x38，opc 在 [31:27]，u32 下就是 0xC0000000。 */
 +	uint32_t cmd = 0xC0000000u | ((uint32_t)(addr & 0xffu) << 4);
 +
@@ -865,7 +866,7 @@ new file mode 100644
 +			    keys_pon_apid, keys_vup_apid);
 +			for (c = 0; c < sizeof(cand) / sizeof(cand[0]); c++) {
 +				uint32_t cmd = cand[c] | ((0x10u & 0xffu) << 4);
-+				uint32_t off = 0x80u * keys_pon_apid;
++				uint32_t off = 0x20u * keys_pon_apid;
 +				uint32_t status = 0;
 +
 +				*(volatile uint32_t *)(keys_obs + off) = cmd;
