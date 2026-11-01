@@ -248,7 +248,7 @@ diff --git a/bsd/dev/k60_keys.c b/bsd/dev/k60_keys.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/k60_keys.c
-@@ -0,0 +1,691 @@
+@@ -0,0 +1,715 @@
 +/*
 + * K60（mondrian，SM8475）物理按键：PON 的电源键/音量减 + PMIC GPIO 的音量加。
 + *
@@ -920,7 +920,31 @@ new file mode 100644
 +					own++;
 +				}
 +			}
-+			printf("K60 KEYS: probe cnfg 0x700 nonzero: %u\n", own);
++			printf("K60 KEYS: probe cnfg 0x700 nonzero: %u\n", own);+		/*
++		 * 合体探测：顺手把 GPU 的 RSCC 窗口读一下。RSCC 以前把机器
++		 * 带走两次，所以放在最后——前面所有结果都已经落盘。
++		 */
++		{
++			int rscc = 0;
++
++			(void)PE_parse_boot_argn("k60rsccprobe", &rscc, sizeof(rscc));
++			if (rscc != 0) {
++				vm_offset_t base = ml_io_map(0x3d50000UL, 0x10000UL);
++
++				if (base == 0) {
++					printf("K60 KEYS: rscc map failed\n");
++				} else {
++					uint32_t w;
++
++					printf("K60 KEYS: rscc 0x3d50000:");
++					for (w = 0; w < 8; w++) {
++						printf(" %#x",
++						    keys_rd(base, 4u * w));
++					}
++					printf("\n");
++				}
++			}
++		}
 +		}
 +		keys_flush();
 +	}
