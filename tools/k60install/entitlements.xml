@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  k60install 默认的 entitlements 模板："要什么给什么"。
+
+  用法:  python3 k60install.py app.ipa 加 sign 选项（可再用 entitlements 选项换文件）
+  ldid 会把这一整份 plist 塞进 app 里每个 Mach-O 的签名里。
+
+  为什么给这么宽:
+    docs/INSTALLER-PLAN.md §2.3：我们的内核不看签名，卡的是 amfid。
+    amfid 一旦被桩成"永远有效 + 原样下发 entitlements"，这份东西就是 App
+    实际拿到的权限，所以宁多勿少。等真机跑起来，再逐项往下砍到最小集。
+
+  上机注意:
+    - 这份模板里没有 application-identifier / team-identifier，某些 App
+      自己会读这俩做校验；需要时换一份带占位的。
+    - iOS 16.7 对 com.apple.private.* 的检查比 15.x 严，某些键给了也没用；
+      真机上如果 App 报 sandbox deny，看 console 日志里 "deny(" 那行再对症加。
+-->
+<plist version="1.0">
+<dict>
+	<!-- 核心: 让进程被当作平台二进制，跳过大部分沙盒/签名门槛 -->
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<!-- 不要"必须有容器"的硬性要求（容器是我们自己造的） -->
+	<key>com.apple.private.security.container-required</key>
+	<false/>
+	<!-- 允许加载没签名的 dylib/framework（自带的那堆 Frameworks） -->
+	<key>com.apple.private.skip-library-validation</key>
+	<true/>
+	<key>com.apple.private.amfi.can-load-cdhash</key>
+	<true/>
+	<!-- 调试: 可被 attach、可读别人内存、可执行 JIT -->
+	<key>get-task-allow</key>
+	<true/>
+	<key>task_for_pid-allow</key>
+	<true/>
+	<key>run-unsigned-code</key>
+	<true/>
+	<key>dynamic-codesigning</key>
+	<true/>
+	<key>com.apple.private.cs.debugger</key>
+	<true/>
+	<!-- 文件系统: 整棵根卷可读写（沙盒例外） -->
+	<key>com.apple.security.exception.files.absolute-path.read-write</key>
+	<array>
+		<string>/</string>
+	</array>
+	<key>com.apple.private.security.storage.AppDataContainers</key>
+	<true/>
+	<key>com.apple.private.security.storage.MobileDocuments</key>
+	<true/>
+	<!-- TCC: 相机/相册/麦克风等先全给，真机再收 -->
+	<key>com.apple.private.tcc.allow</key>
+	<array>
+		<string>kTCCServiceCamera</string>
+		<string>kTCCServicePhotos</string>
+		<string>kTCCServicePhotosAdd</string>
+		<string>kTCCServiceMicrophone</string>
+		<string>kTCCServiceAddressBook</string>
+		<string>kTCCServiceCalendar</string>
+		<string>kTCCServiceReminders</string>
+		<string>kTCCServiceMediaLibrary</string>
+		<string>kTCCServiceMotion</string>
+		<string>kTCCServiceUserTracking</string>
+	</array>
+	<!-- 网络: 允许任意 socket（自签 App 默认没有 network 例外） -->
+	<key>com.apple.private.network.socket-delegate</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<key>com.apple.security.network.server</key>
+	<true/>
+</dict>
+</plist>

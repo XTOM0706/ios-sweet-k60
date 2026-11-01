@@ -129,3 +129,19 @@ UUID 可以自己生成（v4），但 metadata plist 要写对，否则沙盒找
 - Procursus 的包假设 rootless 前缀 `/var/jb`，改前缀可能出现硬编码路径。
 - `uicache` 依赖 `lsd` 的行为，iOS 16.7 与越狱常用的 15/16.0 有差异。
 - App 起不来时，**别先怀疑签名**：先看是不是缺框架（GPU/音频）。
+
+## 7. 实现状态（2026-11-01，离线部分已落地）
+
+| 里程碑 | 状态 | 代码 |
+| --- | --- | --- |
+| I1 | 已实现（宿主） | `tools/bootstrap/build_bootstrap.sh`，自测 `test_build_bootstrap.sh` |
+| I2 | 已实现（宿主） | `tools/k60install/k60install.py`，单测 `test_k60install.py` |
+| I3 | 已实现（ldid 由外部提供） | `k60install.py --sign`；`--verify` 自带 Mach-O 解析代替 `codesign -d` |
+
+- 用法、产物结构、**上机前置清单**见 `tools/k60install/README.md`
+  与 `tools/bootstrap/README.md`。
+- 已验证：假 IPA → 目录树/metadata/install.sh 全流程；假 bootstrap →
+  包闭包裁剪 + 前缀改写 + 解包结构；`install.sh --dry-run` 与真跑（沙盒路径）。
+- 上机待核对：metadata 的 `MCMMetadataContentClass`（Bundle=1/Data=2）与
+  `MCMMetadataPersona`（501）取值、`uicache -p <app 路径>` 的实际行为、
+  iOS 16.7 对 `com.apple.private.*` 的检查强度。

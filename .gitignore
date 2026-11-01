@@ -9,3 +9,6 @@ xnu/out/
 xnu/out-*/
 __pycache__/
 tools/*/build/
+__pycache__/
+*.pyc
+build/
